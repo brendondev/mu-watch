@@ -222,7 +222,7 @@ async function postDiscord(content) {
     const changed = prev.status !== cur.status || prev.location !== cur.location;
     if (changed) {
       const msg = [
-        `**${nick}** mudou:`,
+        `**${nick}** está `,
         prev.status !== cur.status ? `• Status: ${prev.status || "?"} → ${cur.status}` : null,
         prev.location !== cur.location ? `• Localização: ${prev.location || "?"} → ${cur.location}` : null,
       ]
