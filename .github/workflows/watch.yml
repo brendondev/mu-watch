@@ -40,6 +40,10 @@ jobs:
           MU_CHAR_PATH: /pt/char/
           WATCHLIST_FILE: watchlist.txt
           STATE_FILE: .state.json
+          GIT_PERSIST: '1'           # <- para commitar o state.json
+          GIT_USER_NAME: 'bot'       # opcional
+          GIT_USER_EMAIL: 'bot@users.noreply.github.com'  # opcional
+          # FORCE_POST: '1'          # opcional, para forçar post
         run: |
           node -v
           node watcher.js
