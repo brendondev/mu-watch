@@ -2,21 +2,21 @@ name: mu-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # a cada 5 minutos
-  workflow_dispatch: {}     # rodar manualmente
+    - cron: "*/5 * * * *"   # a cada 5 min
+  workflow_dispatch: {}     # executar manualmente
 
 jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # salvar .state.json no repo (opcional)
+      contents: write   # para commitar .state.json
     steps:
       - uses: actions/checkout@v4
 
       - name: Verify source version
         run: |
-          echo "HEAD watcher.js preview:"
-          sed -n '1,120p' watcher.js
+          echo "HEAD watcher.js preview (linhas 1..120):"
+          sed -n '1,120p' watcher.js || true
           if grep -n 'waitUntil: "networkidle"' watcher.js; then
             echo "ERRO: ainda tem networkidle no watcher.js";
             exit 1;
@@ -33,13 +33,16 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Run watcher
+        timeout-minutes: 5
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           MU_BASE_URL: https://mudream.online
           MU_CHAR_PATH: /pt/char/
           WATCHLIST_FILE: watchlist.txt
           STATE_FILE: .state.json
-        run: node watcher.js
+        run: |
+          node -v
+          node watcher.js
 
       - name: Commit state
         if: always()
