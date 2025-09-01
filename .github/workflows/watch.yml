@@ -13,6 +13,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify source version
+        run: |
+          echo "HEAD watcher.js preview:"
+          sed -n '1,120p' watcher.js
+          if grep -n 'waitUntil: "networkidle"' watcher.js; then
+            echo "ERRO: ainda tem networkidle no watcher.js";
+            exit 1;
+          fi
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
