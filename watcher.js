@@ -1,4 +1,4 @@
-// watcher v9 (status do cabeçalho do nick + ensureX50 com el.click())
+// watcher v10 (location pelo par de spans correto; status do cabeçalho do nick)
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -16,7 +16,7 @@ const GIT_PERSIST = process.env.GIT_PERSIST === "1";
 const GIT_USER_NAME = process.env.GIT_USER_NAME || "bot";
 const GIT_USER_EMAIL = process.env.GIT_USER_EMAIL || "bot@users.noreply.github.com";
 
-console.log("watcher version v9");
+console.log("watcher version v10");
 if (!WEBHOOK) { console.error("DISCORD_WEBHOOK_URL ausente"); process.exit(1); }
 
 async function renderChar(nick) {
@@ -32,6 +32,7 @@ async function renderChar(nick) {
   });
   const page = await context.newPage();
 
+  // acelera (mantém <img> no DOM, só não baixa bytes)
   await page.route("**/*", r => {
     const t = r.request().resourceType();
     if (t === "image" || t === "font") return r.abort();
@@ -56,14 +57,13 @@ async function renderChar(nick) {
     }
   };
 
-  // Abre lista e clica GUILDWAR usando el.click() (mesmo que esteja hidden)
+  // força X-50/GUILDWAR clicando via DOM (mesmo hidden)
   const ensureX50 = async () => {
-    for (let attempt = 1; attempt <= 6; attempt++) {
+    for (let attempt = 1; attempt <= 8; attempt++) {
       try {
         const ok = await page.evaluate(() => {
           const norm = (s) => (s || "").replace(/\s+/g, "").toUpperCase();
 
-          // 1) abre o grupo selecionado
           const selected = document.querySelector('div[class*="SideMenuServers_selected"]');
           if (selected) {
             selected.scrollIntoView({ block: "center" });
@@ -72,22 +72,20 @@ async function renderChar(nick) {
             try { selected.click(); } catch {}
           }
 
-          // 2) tenta clicar no item GUILDWAR
-          const all = Array.from(document.querySelectorAll('div[class*="SideMenuServers_list-item"],div[class*="SideMenuServers_item"]'));
-          const gw = all.find(el => /GUILDWAR/.test(norm(el.textContent)));
+          const items = Array.from(document.querySelectorAll('div[class*="SideMenuServers_list-item"],div[class*="SideMenuServers_item"]'));
+          const gw = items.find(el => /GUILDWAR/.test(norm(el.textContent)));
           if (gw) {
             gw.scrollIntoView({ block: "center" });
             try { gw.style.display = ""; } catch {}
             try { gw.click(); } catch {}
           }
 
-          // 3) valida
           const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
           const txt = norm(sel?.textContent || "");
           return /GUILDWAR/.test(txt);
         });
 
-        await page.waitForTimeout(400 + attempt * 200);
+        await page.waitForTimeout(450 + attempt * 150);
         const selectedTxt = await page.locator('div.SideMenuServers_selected__zYRfa').first().innerText().catch(()=>"");
         const normalized = (selectedTxt || "").replace(/\s+/g, "").toUpperCase();
         console.log(`ensureX50 attempt ${attempt} → selected: ${normalized}`);
@@ -103,52 +101,58 @@ async function renderChar(nick) {
     return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(html);
   };
 
-  // Extrai do cabeçalho do nick (status) e do par "Localização:"
+  // ===== leitura robusta =====
   const extract = async () => {
     return await page.evaluate((nickIn) => {
       const norm = (s) =>
         (s || "")
           .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
           .replace(/\s+/g, " ").trim();
-      const eqNick = (s) => norm(s).toLowerCase() === norm(nickIn).toLowerCase();
+      const eqNick = (a,b) => norm(a).toLowerCase() === norm(b).toLowerCase();
 
-      // ===== Cabeçalho: <img alt="..."> + <b>nick</b>
+      // 1) STATUS no cabeçalho (linha do avatar + <b>nick</b>)
       let status = null;
-      const headContainers = Array.from(document.querySelectorAll("div,header,section"));
-      for (const el of headContainers) {
-        const b = el.querySelector("b");
-        if (!b) continue;
-        if (!eqNick(b.textContent || "")) continue;
-        // no mesmo container, pega o <img alt=...>
-        const img = el.querySelector('img[alt="Online"], img[alt="Offline"]') ||
-                    el.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
-        if (img) {
-          const alt = img.getAttribute("alt");
-          if (alt) { status = alt; break; }
-          const src = img.getAttribute("src") || "";
-          if (/online\.png/i.test(src)) { status = "Online"; break; }
-          if (/offline\.png/i.test(src)) { status = "Offline"; break; }
+      {
+        const blocks = Array.from(document.querySelectorAll("div,header,section,article"));
+        for (const el of blocks) {
+          const b = el.querySelector("b");
+          if (!b) continue;
+          if (!eqNick(b.textContent || "", nickIn)) continue;
+          const img = el.querySelector('img[alt="Online"], img[alt="Offline"]') ||
+                      el.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
+          if (img) {
+            const alt = img.getAttribute("alt");
+            if (alt) { status = alt; break; }
+            const src = img.getAttribute("src") || "";
+            if (/online\.png/i.test(src)) { status = "Online"; break; }
+            if (/offline\.png/i.test(src)) { status = "Offline"; break; }
+          }
         }
       }
 
-      // ===== Localização: <span>Localização:</span><span>valor</span>
+      // 2) LOCALIZAÇÃO pelo par de spans no MESMO div
       let location = null;
-      const spans = Array.from(document.querySelectorAll("span"));
-      for (let i = 0; i < spans.length - 1; i++) {
-        if (/^Localiza(c|ç)ao:$/i.test(norm(spans[i].textContent))) {
-          const v = (spans[i + 1].textContent || "").trim();
-          if (v) { location = v; break; }
+      {
+        const divs = Array.from(document.querySelectorAll("div"));
+        for (const d of divs) {
+          const spans = d.querySelectorAll("span");
+          if (spans.length >= 2) {
+            const label = norm(spans[0].textContent || "");
+            if (/^Localizacao:$/i.test(label)) {
+              const val = (spans[1].textContent || "").trim();
+              if (val) { location = val; break; }
+            }
+          }
         }
       }
-      // fallback textual
+      // fallback extra: busca “Localização:” e pega o próximo <span> irmão
       if (!location) {
-        const blocks = Array.from(document.querySelectorAll("div,section,article,li"));
-        for (const el of blocks) {
-          const t = norm(el.textContent || "");
-          if (/Localizacao:/i.test(t)) {
-            const raw = (el.textContent || "").split(/Localiza(?:ção|cao):/i)[1];
-            if (raw) {
-              const v = raw.replace(/^[\s:\-]+/, "").split(/\n| {2,}|\t/)[0].trim();
+        const allSpans = Array.from(document.querySelectorAll("span"));
+        for (let i = 0; i < allSpans.length - 1; i++) {
+          if (/^Localiza(c|ç)ao:$/i.test(norm(allSpans[i].textContent))) {
+            const sib = allSpans[i].nextElementSibling;
+            if (sib && sib.tagName && sib.tagName.toLowerCase() === "span") {
+              const v = (sib.textContent || "").trim();
               if (v) { location = v; break; }
             }
           }
@@ -190,7 +194,7 @@ async function renderChar(nick) {
   }
 }
 
-// ---------- estado / discord ----------
+// ===== estado / discord =====
 async function loadList() { try { const t = await fs.readFile(WATCHLIST_FILE, "utf8"); return t.split(/\r?\n/).map(s=>s.trim()).filter(Boolean); } catch { return []; } }
 async function loadState() { try { return JSON.parse(await fs.readFile(STATE_FILE, "utf8")); } catch { return {}; } }
 async function saveState(obj) { await fs.writeFile(STATE_FILE, JSON.stringify(obj), "utf8"); }
@@ -212,7 +216,7 @@ async function postDiscord(content) {
   } catch (e) { console.error(`Webhook EXCEPTION: ${e.message || e}`); }
 }
 
-// ---------- loop principal ----------
+// ===== loop principal =====
 (async () => {
   const list = await loadList();
   if (!list.length) { console.log("watchlist vazia"); return; }
@@ -228,12 +232,16 @@ async function postDiscord(content) {
     const firstTime = !("status" in prev) && !("location" in prev);
     const FORCE_POST = process.env.FORCE_POST === "1";
 
+    // mensagem: mostra seta só quando mudou; senão mostra valor atual
+    const statusLine = changed && prev.status !== cur.status
+      ? `• Status: ${prev.status || "?"} → ${cur.status}`
+      : `• Status: ${cur.status}`;
+    const locLine = changed && prev.location !== cur.location
+      ? `• Localização: ${prev.location || "?"} → ${cur.location}`
+      : `• Localização: ${cur.location}`;
+
     if (changed || firstTime || FORCE_POST) {
-      const msg = [
-        `**${nick}**`,
-        `• Status: ${prev.status || "?"} → ${cur.status}`,
-        `• Localização: ${prev.location || "?"} → ${cur.location}`,
-      ].join("\n");
+      const msg = [`**${nick}**`, statusLine, locLine].join("\n");
       await postDiscord(msg);
       state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
     } else {
