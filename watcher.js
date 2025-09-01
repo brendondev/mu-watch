@@ -68,39 +68,50 @@ async function renderChar(nick) {
   };
 
   // abre X-5 e seleciona X-50; confirma que X-50 ficou selecionado
-  const ensure50x = async () => {
-    try {
-      const group = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 5")').first();
-      if (await group.count()) {
-        const openBtn = group.locator('svg[class*="open-btn"]');
-        if (await openBtn.count()) { await openBtn.first().click({ timeout: 800 }).catch(()=>{}); }
-        else { await group.click({ timeout: 800 }).catch(()=>{}); }
-        await page.waitForTimeout(400);
+const ensure50x = async () => {
+  const tryDomSwitch = async () => {
+    return await page.evaluate(() => {
+      const byText = (root, re) => {
+        const els = root.querySelectorAll('div[class*="SideMenuServers_item"]');
+        for (const el of els) {
+          const txt = (el.textContent || "").trim();
+          if (re.test(txt)) return el;
+        }
+        return null;
+      };
+
+      // 1) abrir/expandir grupo X - 5 (se tiver botão de expandir)
+      const groupX5 = byText(document, /\bX\s*-\s*5\b/i);
+      if (groupX5) {
+        const btn = groupX5.querySelector('svg[class*="open-btn"]');
+        (btn || groupX5).dispatchEvent(new MouseEvent("click", { bubbles: true }));
       }
 
-      const x50 = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 50")').first();
-      await x50.scrollIntoViewIfNeeded().catch(()=>{});
-      await x50.click({ timeout: 1200 }).catch(()=>{});
-      await page.waitForTimeout(700);
-
-      // confirma seleção
-      let selectedIs50 = await page.evaluate(() => {
-        const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
-        if (!sel) return false;
-        return /X\s*-\s*50/i.test((sel.textContent || "").trim());
-      });
-      if (!selectedIs50) {
-        await x50.click({ timeout: 1200 }).catch(()=>{});
-        await page.waitForTimeout(700);
-        selectedIs50 = await page.evaluate(() => {
-          const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
-          if (!sel) return false;
-          return /X\s*-\s*50/i.test((sel.textContent || "").trim());
-        });
+      // 2) clicar item X - 50
+      const item50 = byText(document, /\bX\s*-\s*50\b/i);
+      if (item50) {
+        item50.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       }
-      console.log("selected 50x:", selectedIs50);
-    } catch {}
+
+      // 3) checar selecionado
+      const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+      const selText = (sel?.textContent || "").trim();
+      return {
+        selectedIs50: /\bX\s*-\s*50\b/i.test(selText),
+        selectedText: selText
+      };
+    });
   };
+
+  let ok = false, last = { selectedIs50: false, selectedText: "" };
+  for (let i = 0; i < 3; i++) {
+    last = await tryDomSwitch();
+    if (last.selectedIs50) { ok = true; break; }
+    await page.waitForTimeout(600);
+  }
+  console.log("selected 50x:", ok, "selectedText:", last.selectedText);
+};
+
 
   const isAntiBot = async () => {
     const html = await page.content();
