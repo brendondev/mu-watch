@@ -67,51 +67,60 @@ async function renderChar(nick) {
     return false;
   };
 
-// Abre o item selecionado "CLASSIC" e clica no list-item "GUILDWAR".
-// Confirma que o selecionado contém "GUILDWAR". Tenta até 4 vezes.
+// Abre o item selecionado "CLASSIC" e clica no list-item "GUILDWAR" com force:true.
+// Checa se o selecionado virou GUILDWAR; tenta até 4 vezes.
 const ensure50x = async () => {
-  const tryOnce = async () => {
+  // sempre começa do topo (evita virtualização/scroll perdido)
+  await page.evaluate(() => window.scrollTo(0, 0));
+
+  const selectedIsGuildwar = async () => {
     return await page.evaluate(() => {
-      const hasClassPart = (el, part) =>
-        !!(el && el.className && el.className.toString().split(/\s+/).some(c => c.includes(part)));
-
-      const isMenuItem = (el) => hasClassPart(el, "SideMenuServers_item");
-
-      // 1) pegar o item atualmente selecionado (SideMenuServers_selected...)
-      const selected = document.querySelector('div[class*="SideMenuServers_selected"]');
-
-      // 1a) se o selecionado é o grupo "CLASSIC", clicar pra expandir (botão open-btn ou no próprio item)
-      if (selected && /CLASSIC/i.test((selected.textContent || ""))) {
-        const openBtn = selected.querySelector('svg[class*="open-btn"]');
-        (openBtn || selected)?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      }
-
-      // 2) procurar o list-item "GUILDWAR" (classe SideMenuServers_list-item__)
-      const allDivs = Array.from(document.querySelectorAll("div"));
-      const guildwarItem =
-        allDivs.find(el => isMenuItem(el) && hasClassPart(el, "SideMenuServers_list-item") && /GUILDWAR/i.test((el.textContent || ""))) ||
-        allDivs.find(el => isMenuItem(el) && /GUILDWAR/i.test((el.textContent || ""))); // fallback
-
-      if (guildwarItem) {
-        guildwarItem.scrollIntoView({ block: "center", inline: "nearest" });
-        guildwarItem.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      }
-
-      // 3) verificar o novo selecionado
       const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
-      const selText = (sel?.textContent || "").replace(/\s+/g, "").toUpperCase();
-      const ok = /GUILDWAR/.test(selText);
-      return { ok, selText };
+      if (!sel) return false;
+      const txt = (sel.textContent || "").replace(/\s+/g, "").toUpperCase();
+      return /GUILDWAR/.test(txt);
     });
   };
 
-  let ok = false, last = { ok: false, selText: "" };
-  for (let i = 0; i < 4; i++) {
-    last = await tryOnce();
-    if (last.ok) { ok = true; break; }
-    await page.waitForTimeout(700);
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      // 1) localizar o item atualmente selecionado (CLASSIC)
+      const selected = page.locator('div[class*="SideMenuServers_selected"]').first();
+      await selected.scrollIntoViewIfNeeded().catch(() => {});
+
+      // 1a) clicar no chevron de abrir (se existir); senão, clicar no próprio item
+      const openBtn = selected.locator('svg[class*="open-btn"]');
+      if (await openBtn.count()) {
+        await openBtn.first().click({ force: true, timeout: 600 }).catch(() => {});
+      } else {
+        await selected.click({ force: true, timeout: 600 }).catch(() => {});
+      }
+      await page.waitForTimeout(400);
+
+      // 2) clicar no list-item "GUILDWAR"
+      const gwItem = page.locator('div[class*="SideMenuServers_list-item"]', { hasText: "GUILDWAR" }).first();
+      // fallback se a classe de list-item mudar
+      const gwAny = page.locator('div[class*="SideMenuServers_item"]', { hasText: "GUILDWAR" }).first();
+
+      const target = (await gwItem.count()) ? gwItem : gwAny;
+      await target.scrollIntoViewIfNeeded().catch(() => {});
+      await target.click({ force: true, timeout: 1200 }).catch(() => {});
+      await page.waitForTimeout(700);
+
+      // 3) checa se selecionou GUILDWAR
+      const ok = await selectedIsGuildwar();
+      const selTxt = await page.evaluate(() => {
+        const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+        return (sel?.textContent || "").replace(/\s+/g, "");
+      });
+      console.log(`ensure50x attempt ${attempt} → selected GUILDWAR: ${ok} selectedText: ${selTxt}`);
+
+      if (ok) return;
+    } catch (e) {
+      console.log(`ensure50x attempt ${attempt} error: ${e?.message || e}`);
+    }
+    await page.waitForTimeout(600);
   }
-  console.log("selected GUILDWAR:", ok, "selectedText:", last.selText);
 };
 
 
