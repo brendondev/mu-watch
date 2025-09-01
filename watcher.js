@@ -1,4 +1,4 @@
-// watcher v3 (no waitFor on locators)
+// watcher v4 (status por alt/src e X-50 garantido, sem waitFor de locator)
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -9,7 +9,7 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 
-console.log("watcher version v3"); // imprime no log da Action
+console.log("watcher version v4");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL ausente");
@@ -35,7 +35,7 @@ async function renderChar(nick) {
 
   const page = await context.newPage();
 
-  // Bloqueia imagens/fontes (rápido e evita bloqueios bobos)
+  // Bloqueia imagens/fontes pra acelerar (o <img> ainda existe no DOM com alt/src)
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "font") return route.abort();
@@ -47,7 +47,7 @@ async function renderChar(nick) {
   // Helpers ---------------------------------------------------
   const closeCookieBanner = async () => {
     const tryClick = async (sel) => {
-      try { await page.locator(sel).first().click({ timeout: 500 }); return true; } catch { return false; }
+      try { await page.locator(sel).first().click({ timeout: 700 }); return true; } catch { return false; }
     };
     if (await tryClick('button:has-text("Permitir todos")')) return true;
     if (await tryClick('button:has-text("Rejeitar")')) return true;
@@ -59,7 +59,7 @@ async function renderChar(nick) {
       try {
         if (/usercentrics|consent|cookiebot/i.test(f.url())) {
           const btn = f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first();
-          await btn.click({ timeout: 700 });
+          await btn.click({ timeout: 800 });
           return true;
         }
       } catch {}
@@ -67,18 +67,38 @@ async function renderChar(nick) {
     return false;
   };
 
-  const switchTo50x = async () => {
+  // abre X-5 e seleciona X-50; confirma que X-50 ficou selecionado
+  const ensure50x = async () => {
     try {
       const group = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 5")').first();
       if (await group.count()) {
         const openBtn = group.locator('svg[class*="open-btn"]');
-        if (await openBtn.count()) { await openBtn.first().click({ timeout: 600 }).catch(()=>{}); }
-        else { await group.click({ timeout: 600 }).catch(()=>{}); }
-        await page.waitForTimeout(350);
+        if (await openBtn.count()) { await openBtn.first().click({ timeout: 800 }).catch(()=>{}); }
+        else { await group.click({ timeout: 800 }).catch(()=>{}); }
+        await page.waitForTimeout(400);
       }
+
       const x50 = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 50")').first();
-      await x50.click({ timeout: 1000 }).catch(()=>{});
-      await page.waitForTimeout(500);
+      await x50.scrollIntoViewIfNeeded().catch(()=>{});
+      await x50.click({ timeout: 1200 }).catch(()=>{});
+      await page.waitForTimeout(700);
+
+      // confirma seleção
+      let selectedIs50 = await page.evaluate(() => {
+        const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+        if (!sel) return false;
+        return /X\s*-\s*50/i.test((sel.textContent || "").trim());
+      });
+      if (!selectedIs50) {
+        await x50.click({ timeout: 1200 }).catch(()=>{});
+        await page.waitForTimeout(700);
+        selectedIs50 = await page.evaluate(() => {
+          const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+          if (!sel) return false;
+          return /X\s*-\s*50/i.test((sel.textContent || "").trim());
+        });
+      }
+      console.log("selected 50x:", selectedIs50);
     } catch {}
   };
 
@@ -106,23 +126,25 @@ async function renderChar(nick) {
         return null;
       };
 
-      const statusFromLabel = (() => {
-        const containers = Array.from(document.querySelectorAll("div,li,section,article"));
-        for (const c of containers) {
-          if (/Status:/i.test(c.textContent || "")) {
-            const img = c.querySelector('img[alt="Online"], img[alt="Offline"]');
-            if (img && img.getAttribute("alt")) return img.getAttribute("alt");
-          }
-        }
-        const any = document.querySelector('img[alt="Online"], img[alt="Offline"]');
-        return any ? any.getAttribute("alt") : null;
+      // STATUS: detectar por alt OU pelo src do ícone (online/offline.png)
+      const statusFromImg = (() => {
+        const img =
+          document.querySelector('img[alt="Online"], img[alt="Offline"]') ||
+          document.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
+        if (!img) return null;
+        const alt = img.getAttribute("alt");
+        if (alt) return alt;
+        const src = img.getAttribute("src") || "";
+        if (/online\.png/i.test(src)) return "Online";
+        if (/offline\.png/i.test(src)) return "Offline";
+        return null;
       })();
 
       const location = findByLabel(/Localiza(ç|c)ão:/i);
 
       return {
-        ok: !!(statusFromLabel || location),
-        status: statusFromLabel || "—",
+        ok: !!(statusFromImg || location),
+        status: statusFromImg || "—",
         location: location || "—"
       };
     });
@@ -133,9 +155,9 @@ async function renderChar(nick) {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
     await closeCookieBanner().catch(()=>{});
-    await switchTo50x().catch(()=>{});
+    await ensure50x().catch(()=>{});
 
-    // dá tempo pra SPA montar
+    // tempo pra SPA montar após o switch
     await page.waitForTimeout(1500);
 
     let data = await extract();
@@ -143,7 +165,7 @@ async function renderChar(nick) {
     if (!data.ok && (await isAntiBot())) {
       await page.waitForTimeout(8000);
       await closeCookieBanner().catch(()=>{});
-      await switchTo50x().catch(()=>{});
+      await ensure50x().catch(()=>{});
       await page.waitForTimeout(1200);
       data = await extract();
     }
