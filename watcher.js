@@ -1,4 +1,4 @@
-// watcher v7 (abre menu com fallback; status/loc do bloco do personagem)
+// watcher v8 (força abrir GUILDWAR via DOM + status do bloco de info)
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -11,12 +11,12 @@ const PATH = process.env.MU_CHAR_PATH || "/pt/char/";
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
+
 const GIT_PERSIST = process.env.GIT_PERSIST === "1";
 const GIT_USER_NAME = process.env.GIT_USER_NAME || "bot";
 const GIT_USER_EMAIL = process.env.GIT_USER_EMAIL || "bot@users.noreply.github.com";
 
-console.log("watcher version v7");
-
+console.log("watcher version v8");
 if (!WEBHOOK) { console.error("DISCORD_WEBHOOK_URL ausente"); process.exit(1); }
 
 async function renderChar(nick) {
@@ -57,37 +57,40 @@ async function renderChar(nick) {
     }
   };
 
-  // Abre a lista e escolhe GUILDWAR (3 tentativas com fallbacks)
+  // Abre a lista e clica GUILDWAR com DOM-level click (funciona mesmo hidden)
   const ensureX50 = async () => {
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= 5; attempt++) {
       try {
-        const selected = page.locator('div.SideMenuServers_selected__zYRfa').first();
-
-        // 1) tenta seta (pode estar hidden)
-        const arrow = page.locator('svg.SideMenuServers_open-btn__Rsa_X').first();
-        const arrowVisible = await arrow.isVisible().catch(() => false);
-        if (arrowVisible) {
-          await arrow.click({ force: true, timeout: 1500 });
-        } else {
-          // 2) clica no bloco selecionado (abre o menu mesmo com seta hidden)
-          await selected.click({ force: true, timeout: 1500 }).catch(() => {});
-          // 3) último recurso: clique coordenado no canto direito do bloco
-          const box = await selected.boundingBox().catch(() => null);
-          if (box) {
-            await page.mouse.click(Math.floor(box.x + box.width - 10), Math.floor(box.y + box.height / 2));
+        const ok = await page.evaluate(() => {
+          const norm = (s) => (s || "").replace(/\s+/g, "").toUpperCase();
+          // 1) acha o bloco selecionado (geralmente "X - 5 CLASSIC")
+          const selected = document.querySelector('div[class*="SideMenuServers_selected"]');
+          if (selected) {
+            // tenta seta
+            const arrow = selected.querySelector('svg[class*="open-btn"]');
+            if (arrow) arrow.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+            // fallback: clica no próprio bloco
+            selected.dispatchEvent(new MouseEvent("click", { bubbles: true }));
           }
-        }
-
-        // seleciona GUILDWAR
-        const guild = page.locator('div.SideMenuServers_list-item__qzJXK', { hasText: "GUILDWAR" }).first();
-        await guild.waitFor({ timeout: 2500 });
-        await guild.click({ force: true, timeout: 1500 });
-
-        await page.waitForTimeout(3200);
-        const selText = await selected.innerText().catch(() => "");
+          // 2) acha qualquer list-item com GUILDWAR
+          const items = Array.from(document.querySelectorAll('div[class*="SideMenuServers_list-item"],div[class*="SideMenuServers_item"]'));
+          const gw = items.find(el => /GUILDWAR/.test(norm(el.textContent)));
+          if (gw) {
+            // remove display:none se houver e clica
+            (gw.style && (gw.style.display = "block"));
+            gw.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+          }
+          // 3) confirma texto do selecionado atualizado
+          const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+          const txt = norm(sel?.textContent || "");
+          return /GUILDWAR/.test(txt);
+        });
+        // pequeno wait para SPA aplicar
+        await page.waitForTimeout(500 + attempt * 200);
+        const selText = await page.locator('div.SideMenuServers_selected__zYRfa').first().innerText().catch(()=>"");
         const normalized = (selText || "").replace(/\s+/g, "").toUpperCase();
         console.log(`ensureX50 attempt ${attempt} → selected: ${normalized}`);
-        if (/GUILDWAR/.test(normalized)) return;
+        if (ok || /GUILDWAR/.test(normalized)) return;
       } catch (e) {
         console.log("ensureX50 error:", e?.message || e);
       }
@@ -99,30 +102,32 @@ async function renderChar(nick) {
     return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(html);
   };
 
-  // Extrai **apenas** do container que tem “Localização:”
+  // Extrai do bloco que contém “Localização:” e, se possível, do rótulo “Status:”
   const extract = async () => {
     return await page.evaluate(() => {
-      const norm = (s) =>
+      const normA = (s) =>
         (s || "")
           .normalize("NFD")
           .replace(/[\u0300-\u036f]/g, "")
           .replace(/\s+/g, " ")
           .trim();
 
-      // Acha o container do bloco de informações do personagem
+      const hasLabel = (el, labelRe) =>
+        Array.from(el.querySelectorAll("span")).some((s) => labelRe.test(normA(s.textContent)));
+
+      // 1) acha o container de info (tem "Localização:")
       const containers = Array.from(document.querySelectorAll("div,section,article,li"));
       let info = null;
       for (const el of containers) {
-        const t = norm(el.textContent);
-        if (/Localizacao:/i.test(t)) { info = el; break; }
+        if (/Localizacao:/i.test(normA(el.textContent || ""))) { info = el; break; }
       }
       if (!info) return { ok: false, status: "—", location: "—" };
 
-      // Localização
+      // 2) Localização (mesma lógica robusta)
       let location = null;
       const spans = Array.from(info.querySelectorAll("span"));
       if (spans.length) {
-        let idx = spans.findIndex(s => /^Localiza(c|ç)ao:$/i.test(norm(s.textContent)));
+        let idx = spans.findIndex((s) => /^Localiza(c|ç)ao:$/i.test(normA(s.textContent)));
         if (idx >= 0) {
           const next = spans[idx + 1];
           const val = next && (next.textContent || "").trim();
@@ -130,7 +135,7 @@ async function renderChar(nick) {
         }
         if (!location) {
           for (let i = 0; i < spans.length - 1; i++) {
-            if (/^Localiza(c|ç)ao:$/i.test(norm(spans[i].textContent))) {
+            if (/^Localiza(c|ç)ao:$/i.test(normA(spans[i].textContent))) {
               const val = (spans[i + 1].textContent || "").trim();
               if (val) { location = val; break; }
             }
@@ -139,8 +144,8 @@ async function renderChar(nick) {
         if (!location) {
           const last = spans[spans.length - 1];
           const val = (last?.textContent || "").trim();
-          const hasLabel = spans.some(s => /Localiza(c|ç)ao:/i.test(norm(s.textContent)));
-          if (hasLabel && val && !/Localiza(c|ç)ao:/i.test(norm(val))) location = val;
+          const hasLoc = spans.some((s) => /Localiza(c|ç)ao:/i.test(normA(s.textContent)));
+          if (hasLoc && val && !/Localiza(c|ç)ao:/i.test(normA(val))) location = val;
         }
       }
       if (!location) {
@@ -151,33 +156,39 @@ async function renderChar(nick) {
         }
       }
 
-      // Status – **somente dentro do mesmo bloco info** (e proximidades diretas)
+      // 3) Status — PRIORIDADE: rótulo "Status:" dentro do mesmo bloco
       let status = null;
-      const inInfo =
-        info.querySelector('img[alt="Online"], img[alt="Offline"]') ||
-        info.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
-      if (inInfo) {
-        const alt = inInfo.getAttribute("alt");
-        if (alt) status = alt;
-        else {
-          const src = inInfo.getAttribute("src") || "";
-          if (/online\.png/i.test(src)) status = "Online";
-          else if (/offline\.png/i.test(src)) status = "Offline";
+      if (hasLabel(info, /Status:/i)) {
+        const sps = Array.from(info.querySelectorAll("span"));
+        for (let i = 0; i < sps.length; i++) {
+          if (/^Status:$/i.test(normA(sps[i].textContent))) {
+            // próximo IMG alt ou src, ou texto do próximo span
+            const nextImg = sps[i].parentElement?.querySelector('img[alt="Online"], img[alt="Offline"]');
+            if (nextImg) {
+              status = nextImg.getAttribute("alt") ||
+                       (/online\.png/i.test(nextImg.getAttribute("src") || "") ? "Online"
+                         : /offline\.png/i.test(nextImg.getAttribute("src") || "") ? "Offline" : null);
+              if (status) break;
+            }
+            const nextSpan = sps[i + 1];
+            if (!status && nextSpan) {
+              const txt = (nextSpan.textContent || "").trim();
+              if (/^Online$/i.test(txt)) { status = "Online"; break; }
+              if (/^Offline$/i.test(txt)) { status = "Offline"; break; }
+            }
+          }
         }
       }
-      // fallback: olha o pai imediato
-      if (!status && info.parentElement) {
-        const near =
-          info.parentElement.querySelector('img[alt="Online"], img[alt="Offline"]') ||
-          info.parentElement.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
-        if (near) {
-          const alt = near.getAttribute("alt");
-          if (alt) status = alt;
-          else {
-            const src = near.getAttribute("src") || "";
-            if (/online\.png/i.test(src)) status = "Online";
-            else if (/offline\.png/i.test(src)) status = "Offline";
-          }
+
+      // 4) Fallback: IMG dentro do bloco info (evita pegar ícones do menu)
+      if (!status) {
+        const inInfo =
+          info.querySelector('img[alt="Online"], img[alt="Offline"]') ||
+          info.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
+        if (inInfo) {
+          status = inInfo.getAttribute("alt") ||
+                   (/online\.png/i.test(inInfo.getAttribute("src") || "") ? "Online"
+                     : /offline\.png/i.test(inInfo.getAttribute("src") || "") ? "Offline" : null);
         }
       }
 
@@ -191,7 +202,7 @@ async function renderChar(nick) {
     await ensureX50().catch(() => {});
     await page.waitForTimeout(1200);
 
-    // Retry curto para a SPA montar o bloco de “Localização”
+    // retry curto
     let data = { ok: false, status: "—", location: "—" };
     for (let i = 0; i < 4; i++) {
       data = await extract();
@@ -240,9 +251,6 @@ async function postDiscord(content) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ content }),
     });
-    const body = await res.text().catch(() => "");
-    if (!res.ok) console.error(`Webhook FAILED: ${res.status} ${res.statusText} :: ${body.slice(0,200)}`);
-    else console.log(`Webhook OK: ${res.status}`);
   } catch (e) { console.error(`Webhook EXCEPTION: ${e.message || e}`); }
 }
 
@@ -276,5 +284,5 @@ async function postDiscord(content) {
   }
 
   await saveState(state);
-  await persistStateGit(); // commita e dá push (se GIT_PERSIST=1)
+  await persistStateGit();
 })();
