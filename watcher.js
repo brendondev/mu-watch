@@ -69,32 +69,39 @@ async function renderChar(nick) {
     return false;
   };
 
-  const switchTo50x = async () => {
-    // procura botões/links visíveis com "50x" ou "x50"
-    const candidates = [
-      'a:has-text("50x")', 'button:has-text("50x")',
-      'a:has-text("x50")', 'button:has-text("x50")',
-      'a:has-text("50 X")', 'button:has-text("50 X")'
-    ];
-    for (const sel of candidates) {
-      const loc = page.locator(sel);
-      if (await loc.count().catch(() => 0)) {
-        try {
-          await loc.first().click({ timeout: 1500 });
-          await page.waitForTimeout(800); // deixa aplicar o filtro/versão
-          return true;
-        } catch {}
+const switchTo50x = async () => {
+  try {
+    // 1) abrir o grupo "X - 5" (tem o botão com SVG 'open-btn')
+    const group = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 5")').first();
+    if (await group.count()) {
+      // tenta clicar no botão de expandir se existir
+      const openBtn = group.locator('svg[class*="open-btn"]');
+      if (await openBtn.count()) {
+        await openBtn.first().click({ timeout: 1500 });
+      } else {
+        // fallback: clicar no próprio item
+        await group.click({ timeout: 1500 });
       }
+      await page.waitForTimeout(500);
     }
-    // fallback: tentar via script
-    await page.evaluate(() => {
-      const all = Array.from(document.querySelectorAll("a,button"));
-      const el = all.find(e => /(^|\s)(50x|x50)(\s|$)/i.test((e.textContent||"").trim()));
-      if (el) (el).click();
-    }).catch(() => {});
-    await page.waitForTimeout(600);
+
+    // 2) clicar no item "X - 50"
+    const x50 = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 50")').first();
+    await x50.click({ timeout: 2500 });
+
+    // pequena espera para aplicar o contexto 50x
+    await page.waitForTimeout(800);
     return true;
-  };
+  } catch {
+    // fallback genérico por texto
+    await page.locator('text=/\\bX\\s*-\\s*5\\b/i').first().click({ timeout: 1000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    await page.locator('text=/\\bX\\s*-\\s*50\\b/i').first().click({ timeout: 1500 }).catch(() => {});
+    await page.waitForTimeout(600);
+    return false;
+  }
+};
+
   // ----------------------------------------------------------
 
   try {
