@@ -35,7 +35,7 @@ async function renderChar(nick) {
 
   const page = await context.newPage();
 
-  // bloqueia imagens e fontes p/ acelerar
+  // bloqueia imagens/fontes p/ acelerar
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "font") return route.abort();
@@ -44,24 +44,22 @@ async function renderChar(nick) {
 
   const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
 
-  // helpers --------------------------------------------------
+  // --- helpers ------------------------------------------------
   const closeCookieBanner = async () => {
-    // 1) direto no DOM
     const tryClick = async (sel) => {
-      try { await page.locator(sel).first().click({ timeout: 1500 }); return true; } catch { return false; }
+      try { await page.locator(sel).first().click({ timeout: 800 }); return true; } catch { return false; }
     };
     if (await tryClick('button:has-text("Permitir todos")')) return true;
     if (await tryClick('button:has-text("Rejeitar")')) return true;
     if (await tryClick('text=Permitir todos')) return true;
     if (await tryClick('text=Rejeitar')) return true;
 
-    // 2) alguns Cookiebot vêm em iframe (Usercentrics)
-    const frames = page.frames();
-    for (const f of frames) {
+    // iframes (Usercentrics/Cookiebot)
+    for (const f of page.frames()) {
       try {
         if (/usercentrics|consent|cookiebot/i.test(f.url())) {
-          const btn = f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first();
-          await btn.click({ timeout: 1500 });
+          const b = f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first();
+          await b.click({ timeout: 800 });
           return true;
         }
       } catch {}
@@ -69,60 +67,39 @@ async function renderChar(nick) {
     return false;
   };
 
-const switchTo50x = async () => {
-  try {
-    // 1) abrir o grupo "X - 5" (tem o botão com SVG 'open-btn')
-    const group = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 5")').first();
-    if (await group.count()) {
-      // tenta clicar no botão de expandir se existir
-      const openBtn = group.locator('svg[class*="open-btn"]');
-      if (await openBtn.count()) {
-        await openBtn.first().click({ timeout: 1500 });
-      } else {
-        // fallback: clicar no próprio item
-        await group.click({ timeout: 1500 });
+  const switchTo50x = async () => {
+    try {
+      const group = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 5")').first();
+      if (await group.count()) {
+        const openBtn = group.locator('svg[class*="open-btn"]');
+        if (await openBtn.count()) {
+          await openBtn.first().click({ timeout: 800 }).catch(()=>{});
+        } else {
+          await group.click({ timeout: 800 }).catch(()=>{});
+        }
+        await page.waitForTimeout(400);
       }
-      await page.waitForTimeout(500);
-    }
+      const x50 = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 50")').first();
+      await x50.click({ timeout: 1200 }).catch(()=>{});
+      await page.waitForTimeout(600);
+    } catch {}
+  };
 
-    // 2) clicar no item "X - 50"
-    const x50 = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 50")').first();
-    await x50.click({ timeout: 2500 });
+  const isAntiBot = async () => {
+    const html = await page.content();
+    return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(html);
+  };
 
-    // pequena espera para aplicar o contexto 50x
-    await page.waitForTimeout(800);
-    return true;
-  } catch {
-    // fallback genérico por texto
-    await page.locator('text=/\\bX\\s*-\\s*5\\b/i').first().click({ timeout: 1000 }).catch(() => {});
-    await page.waitForTimeout(400);
-    await page.locator('text=/\\bX\\s*-\\s*50\\b/i').first().click({ timeout: 1500 }).catch(() => {});
-    await page.waitForTimeout(600);
-    return false;
-  }
-};
-
-  // ----------------------------------------------------------
-
-  try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-
-    // fecha cookie banner se aparecer
-    await closeCookieBanner().catch(() => {});
-    // garante versão 50x (se houver toggle)
-    await switchTo50x().catch(() => {});
-
-    // pequena espera pro conteúdo montar
-    await page.waitForTimeout(1200);
-
-    // extração mais tolerante (sem depender de visibilidade)
-    const data = await page.evaluate(() => {
+  const extract = async () => {
+    return await page.evaluate(() => {
       const findByLabel = (labelRe) => {
         const spans = Array.from(document.querySelectorAll("span"));
         for (let i = 0; i < spans.length; i++) {
           const t = (spans[i].textContent || "").trim();
           if (labelRe.test(t)) {
-            const next = spans[i].parentElement?.querySelectorAll("span")?.[1] || spans[i].nextElementSibling;
+            const next =
+              spans[i].parentElement?.querySelectorAll("span")?.[1] ||
+              spans[i].nextElementSibling;
             if (next?.tagName?.toLowerCase() === "span") {
               const val = (next.textContent || "").trim();
               if (val) return val;
@@ -132,6 +109,7 @@ const switchTo50x = async () => {
         return null;
       };
 
+      // status: preferir img perto do bloco que contém "Status:"
       const statusFromLabel = (() => {
         const containers = Array.from(document.querySelectorAll("div,li,section,article"));
         for (const c of containers) {
@@ -152,14 +130,40 @@ const switchTo50x = async () => {
         location: location || "—"
       };
     });
+  };
+  // ------------------------------------------------------------
+
+  try {
+    // navega sem networkidle
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    // fecha cookies e força 50x
+    await closeCookieBanner().catch(()=>{});
+    await switchTo50x().catch(()=>{});
+
+    // dá tempo pra SPA montar
+    await page.waitForTimeout(1500);
+
+    // 1ª extração
+    let data = await extract();
+
+    // se anti-bot, espera e tenta de novo
+    if (!data.ok && (await isAntiBot())) {
+      await page.waitForTimeout(8000);
+      await closeCookieBanner().catch(()=>{});
+      await switchTo50x().catch(()=>{});
+      await page.waitForTimeout(1200);
+      data = await extract();
+    }
 
     await browser.close();
-    return data;
+    return data.ok ? data : { ok: false, status: "—", location: "—", error: "conteúdo não encontrado" };
   } catch (e) {
     await browser.close();
     return { ok: false, status: "—", location: "—", error: e.message || String(e) };
   }
 }
+
 
 
 // ======================
