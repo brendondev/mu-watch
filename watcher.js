@@ -1,10 +1,8 @@
-// watcher v14 — robust Location near nick header; "Lorencia" => "Privada"
+// watcher v16 — restore X-50 selection + header-anchored status/location + state persistence
 import { chromium } from "playwright";
 import fs from "fs/promises";
+import path from "path";
 import fetch from "node-fetch";
-import { exec as _exec } from "child_process";
-import { promisify } from "util";
-const exec = promisify(_exec);
 
 const BASE = process.env.MU_BASE_URL || "https://mudream.online";
 const PATH = process.env.MU_CHAR_PATH || "/pt/char/";
@@ -12,31 +10,47 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 
-const GIT_PERSIST = process.env.GIT_PERSIST === "1";
-const GIT_USER_NAME = process.env.GIT_USER_NAME || "bot";
-const GIT_USER_EMAIL = process.env.GIT_USER_EMAIL || "bot@users.noreply.github.com";
+console.log("watcher version v16");
 
-console.log("watcher version v14");
-if (!WEBHOOK) { console.error("DISCORD_WEBHOOK_URL missing"); process.exit(1); }
-
-const normalizePlain = (s) =>
-  (s || "")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .replace(/\u00A0/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-function mapLocation(value) {
-  const n = normalizePlain(value).toLowerCase();
-  if (n.startsWith("lorencia")) return "Private";
-  return value;
+if (!WEBHOOK) {
+  console.error("DISCORD_WEBHOOK_URL is missing");
+  process.exit(1);
 }
 
+/* ------------------------- FS + Discord utils ------------------------- */
+async function ensureDirOf(filePath) {
+  const dir = path.dirname(path.resolve(filePath));
+  await fs.mkdir(dir, { recursive: true }).catch(() => {});
+}
+async function loadList() {
+  try {
+    const raw = await fs.readFile(WATCHLIST_FILE, "utf8");
+    return raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+  } catch { return []; }
+}
+async function loadState() {
+  try { return JSON.parse(await fs.readFile(STATE_FILE, "utf8")); }
+  catch { return {}; }
+}
+async function saveState(obj) {
+  await ensureDirOf(STATE_FILE);
+  await fs.writeFile(STATE_FILE, JSON.stringify(obj, null, 2), "utf8");
+}
+async function postDiscord(content) {
+  await fetch(WEBHOOK, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+}
+
+/* ---------------------------- Scraping core --------------------------- */
 async function renderChar(nick) {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
+
   const context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -47,19 +61,22 @@ async function renderChar(nick) {
     },
     viewport: { width: 1366, height: 768 },
   });
+
   const page = await context.newPage();
 
-  // speed-up
-  await page.route("**/*", (r) => {
-    const t = r.request().resourceType();
-    if (t === "image" || t === "font") return r.abort();
-    return r.continue();
+  // speed-up (alt/src remains in DOM)
+  await page.route("**/*", route => {
+    const t = route.request().resourceType();
+    if (t === "font" || t === "image") return route.abort();
+    return route.continue();
   });
 
   const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
 
   const closeCookieBanner = async () => {
-    const tryClick = async (sel) => { try { await page.locator(sel).first().click({ timeout: 700 }); return true; } catch { return false; } };
+    const tryClick = async sel => {
+      try { await page.locator(sel).first().click({ timeout: 700 }); return true; } catch { return false; }
+    };
     if (await tryClick('button:has-text("Permitir todos")')) return;
     if (await tryClick('button:has-text("Rejeitar")')) return;
     if (await tryClick('text=Permitir todos')) return;
@@ -74,191 +91,161 @@ async function renderChar(nick) {
     }
   };
 
+  // robust “open X-5/CLASSIC” -> click “GUILDWAR” -> confirm selected shows GUILDWAR
   const ensureX50 = async () => {
-    for (let attempt = 1; attempt <= 8; attempt++) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
       try {
-        const ok = await page.evaluate(() => {
-          const norm = (s) => (s || "").replace(/\s+/g, "").toUpperCase();
-          const selected = document.querySelector('div[class*="SideMenuServers_selected"]');
-          if (selected) {
-            selected.scrollIntoView({ block: "center" });
-            const arrow = selected.querySelector('svg[class*="open-btn"]');
-            try { arrow?.click(); } catch {}
-            try { selected.click(); } catch {}
-          }
-          const items = Array.from(document.querySelectorAll('div[class*="SideMenuServers_list-item"],div[class*="SideMenuServers_item"]'));
-          const gw = items.find(el => /GUILDWAR/.test(norm(el.textContent)));
-          if (gw) { gw.scrollIntoView({ block: "center" }); try { gw.style.display=""; } catch {}; try { gw.click(); } catch {} }
-          const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
-          return /GUILDWAR/.test(norm(sel?.textContent||""));
-        });
-        await page.waitForTimeout(450 + attempt * 150);
-        if (ok) return;
-      } catch {}
+        // make sure left menu exists
+        await page.waitForSelector('div[class*="SideMenuServers_item"]', { timeout: 3000 });
+
+        // open group (CLASSIC / X - 5)
+        const classic = page.locator('div[class*="SideMenuServers_item"]', { hasText: /CLASSIC|X\s*-\s*5/i }).first();
+        await classic.scrollIntoViewIfNeeded().catch(() => {});
+        // try chevron, otherwise click the block
+        const chevron = classic.locator('svg[class*="open-btn"]').first();
+        if (await chevron.count()) {
+          await chevron.click({ force: true, timeout: 1200 }).catch(()=>{});
+        } else {
+          await classic.click({ force: true, timeout: 1200 }).catch(()=>{});
+        }
+        await page.waitForTimeout(400);
+
+        // click GUILDWAR option (X - 50)
+        const gw = page.locator('div[class*="SideMenuServers_item"], div[class*="SideMenuServers_list-item"]', { hasText: /GUILDWAR|X\s*-\s*50/i }).first();
+        await gw.scrollIntoViewIfNeeded().catch(()=>{});
+        await gw.click({ force: true, timeout: 2000 }).catch(()=>{});
+        await page.waitForTimeout(700);
+
+        // confirm selected label
+        const selectedText = (await page.locator('div[class*="SideMenuServers_selected"]').first().innerText().catch(()=>"" )) || "";
+        const normalized = selectedText.replace(/\s+/g, "").toUpperCase();
+        console.log(`ensureX50 attempt ${attempt} → selected: ${normalized}`);
+        if (/GUILDWAR|X-50/.test(normalized)) return;
+      } catch (e) {
+        console.log(`ensureX50 attempt ${attempt} error: ${e?.message || e}`);
+      }
+      await page.waitForTimeout(500);
     }
   };
 
-  const isAntiBot = async () => {
-    const html = await page.content();
-    return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(html);
-  };
+  const extractHeader = async (nickLower) => {
+    return await page.evaluate((nickLower_) => {
+      const norm = (s) => (s || "").trim().toLowerCase();
 
-  const extract = async () => {
-    return await page.evaluate((nickIn) => {
-      const nrm = (s) =>
-        (s || "")
-          .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-          .replace(/\u00A0/g, " ")
-          .replace(/\s+/g, " ")
-          .trim();
-      const eqNick = (a,b)=> nrm(a).toLowerCase() === nrm(b).toLowerCase();
-      const isLocLabel = (txt) => nrm(txt).replace(/:\s*$/,"").toLowerCase() === "localizacao";
+      // 1) find <b>nick</b> in header
+      const b = Array.from(document.querySelectorAll("b")).find(el => norm(el.textContent) === nickLower_);
+      if (!b) return { ok: false, status: null, location: null, reason: "nick-not-found" };
 
-      // --- find header block (the one that contains <b>nick</b>) ---
-      const allBlocks = Array.from(document.querySelectorAll("div,header,section,article"));
-      let header = null;
-      for (const el of allBlocks) {
-        const b = el.querySelector("b");
-        if (b && eqNick(b.textContent || "", nickIn)) { header = el; break; }
-      }
+      // 2) get header container
+      const header = b.closest('[class*="CharPage_char-header"]') ||
+                     b.closest('[class*="CharPage_name-block"]') ||
+                     b.parentElement;
 
-      // STATUS from header img next to <b>nick</b>
+      if (!header) return { ok: false, status: null, location: null, reason: "header-not-found" };
+
+      // 3) status icon near nick
       let status = null;
-      if (header) {
-        const img =
-          header.querySelector('img[alt="Online"], img[alt="Offline"]') ||
-          header.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
-        if (img) {
-          status = img.getAttribute("alt") ||
-                   (/online\.png/i.test(img.getAttribute("src")||"") ? "Online" :
-                    /offline\.png/i.test(img.getAttribute("src")||"") ? "Offline" : null);
+      const sImg = header.querySelector('img[alt="Online"], img[alt="Offline"]') ||
+                   header.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
+      if (sImg) {
+        const alt = sImg.getAttribute("alt");
+        if (alt) status = alt;
+        else {
+          const src = sImg.getAttribute("src") || "";
+          if (/online\.png/i.test(src)) status = "Online";
+          if (/offline\.png/i.test(src)) status = "Offline";
         }
       }
 
-      // LOCATION: choose the "Localização:" span whose container is NEAREST to header in DOM
-      function distance(a, b) {
-        if (!a || !b) return 1e9;
-        // compute depth
-        const path = (node) => { const arr=[]; while (node) { arr.push(node); node=node.parentElement; } return arr; };
-        const pa = path(a), pb = path(b);
-        // LCA distance
-        let i = pa.length - 1, j = pb.length - 1, common = 0;
-        while (i >= 0 && j >= 0 && pa[i] === pb[j]) { common++; i--; j--; }
-        const da = pa.length - common, db = pb.length - common;
-        return da + db;
-      }
-
+      // 4) location inside the same header block (CharPage_char-info…)
       let location = null;
-      let bestDist = 1e9;
-
-      const candidateSpans = Array.from(document.querySelectorAll("span")).filter(sp => isLocLabel(sp.textContent || ""));
-      for (const sp of candidateSpans) {
-        // value = next sibling span OR next span inside same container
-        let val = null;
-
-        // sibling chain
-        let sib = sp.nextElementSibling;
-        while (sib && sib.tagName && sib.tagName.toLowerCase() !== "span") sib = sib.nextElementSibling;
-        if (sib && sib.tagName?.toLowerCase() === "span") {
-          const v = (sib.textContent || "").trim();
-          if (v) val = v;
-        }
-
-        // fallback: any following span in same container
-        if (!val) {
-          const cont = sp.parentElement;
-          const spans = cont ? Array.from(cont.querySelectorAll("span")) : [];
-          const idx = spans.indexOf(sp);
-          for (let k = idx + 1; k < spans.length; k++) {
-            const v = (spans[k].textContent || "").trim();
-            if (v) { val = v; break; }
+      const infoBlock = header.querySelector('[class*="CharPage_char-info"]') || header;
+      const spans = Array.from(infoBlock.querySelectorAll("span"));
+      for (let i = 0; i < spans.length; i++) {
+        const t = (spans[i].textContent || "").trim();
+        if (/^Localiza(?:ç|c)ão:$/i.test(t) || /^Location:$/i.test(t)) {
+          const next = spans[i].nextElementSibling;
+          if (next && next.tagName?.toLowerCase() === "span") {
+            location = (next.textContent || "").trim();
+            break;
+          }
+          // fallback: second span in same parent
+          const sibs = spans[i].parentElement?.querySelectorAll("span");
+          if (sibs && sibs.length >= 2) {
+            location = (sibs[1].textContent || "").trim();
+            break;
           }
         }
-
-        if (val) {
-          const d = distance(header, sp);
-          if (d < bestDist) { bestDist = d; location = val; }
-        }
       }
 
+      if (location && /^\s*lorencia/i.test(location)) location = "Privada";
+
       return { ok: !!(status || location), status: status || "—", location: location || "—" };
-    }, nick);
+    }, nickLower);
   };
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await closeCookieBanner().catch(() => {});
-    await ensureX50().catch(() => {});
-    await page.waitForTimeout(1200);
+    await closeCookieBanner().catch(()=>{});
 
-    let data = { ok: false, status: "—", location: "—" };
-    for (let i = 0; i < 5; i++) {
-      data = await extract();
-      console.log(`extract try ${i+1} → ok=${data.ok} status=${data.status} location=${data.location}`);
-      if (data.location !== "—" || data.status !== "—") break;
-      await page.waitForTimeout(700);
-    }
+    // ensure side menu is ready, then force X-50
+    await page.waitForTimeout(600);
+    await ensureX50().catch(()=>{});
 
-    if (!data.ok && (await isAntiBot())) {
-      await page.waitForTimeout(8000);
-      await closeCookieBanner().catch(() => {});
-      await ensureX50().catch(() => {});
+    // let SPA hydrate header
+    await page.waitForSelector('div[class*="CharPage_char-header"]', { timeout: 6000 }).catch(()=>{});
+    await page.waitForTimeout(900);
+
+    let data = await extractHeader(nick.trim().toLowerCase());
+    if (!data.ok) {
       await page.waitForTimeout(1200);
-      data = await extract();
-      console.log(`extract (anti-bot) → ok=${data.ok} status=${data.status} location=${data.location}`);
+      data = await extractHeader(nick.trim().toLowerCase());
     }
 
     await browser.close();
-
-    if (data.location && data.location !== "—") {
-      data.location = mapLocation(data.location);
-    }
-    return data.ok ? data : { ok: false, status: "—", location: "—", error: "content not found" };
+    return data.ok ? data : { ok: false, status: "—", location: "—", error: "content-not-found" };
   } catch (e) {
     await browser.close();
     return { ok: false, status: "—", location: "—", error: e.message || String(e) };
   }
 }
 
-/* ---------------- state / discord ---------------- */
-async function loadList() { try { const t = await fs.readFile(WATCHLIST_FILE, "utf8"); return t.split(/\r?\n/).map(s=>s.trim()).filter(Boolean); } catch { return []; } }
-async function loadState() { try { return JSON.parse(await fs.readFile(STATE_FILE, "utf8")); } catch { return {}; } }
-async function saveState(obj) { await fs.writeFile(STATE_FILE, JSON.stringify(obj), "utf8"); }
-async function persistStateGit() {
-  if (!GIT_PERSIST) return;
-  try {
-    await exec(`git config user.name "${GIT_USER_NAME}"`);
-    await exec(`git config user.email "${GIT_USER_EMAIL}"`);
-    try { await exec(`git pull --rebase`); } catch {}
-    await exec(`git add ${STATE_FILE}`);
-    await exec(`git commit -m "chore(state): update ${new Date().toISOString()}" || true`);
-    await exec(`git push`);
-    console.log("state.json: commit + push OK");
-  } catch (e) { console.error("persistStateGit error:", e?.stdout || e?.message || String(e)); }
-}
-async function postDiscord(content) {
-  try {
-    await fetch(WEBHOOK, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content }) });
-  } catch (e) { console.error(`Webhook exception: ${e.message || e}`); }
-}
-
-/* ---------------- main ---------------- */
+/* ------------------------------ Main loop ----------------------------- */
 (async () => {
   const list = await loadList();
   if (!list.length) { console.log("watchlist is empty"); return; }
 
-  const state = await loadState();
+  let state = await loadState();
+  if (!state || typeof state !== "object") state = {};
+  await saveState(state); // make sure file exists
 
-  for (const nick of list) {
+  let changedAnything = false;
+
+  for (const raw of list) {
+    const nick = raw.trim();
+    if (!nick) continue;
+
     const cur = await renderChar(nick);
     if (!cur.ok) { console.log(`fail ${nick}: ${cur.error || "no data"}`); continue; }
 
-    const msg = [`**${nick}**`, `• Status: ${cur.status}`, `• Location: ${cur.location}`].join("\n");
-    await postDiscord(msg);
+    const prev = state[nick] || {};
+    const changed = prev.status !== cur.status || prev.location !== cur.location;
 
+    // persist current snapshot
     state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
+    changedAnything ||= changed;
+
+    if (changed) {
+      const msg = [`**${nick}**`, `• Status: ${cur.status}`, `• Location: ${cur.location}`].join("\n");
+      await postDiscord(msg);
+      console.log(`notified ${nick}: ${cur.status} / ${cur.location}`);
+    } else {
+      console.log(`no change ${nick}: ${cur.status} / ${cur.location}`);
+    }
   }
 
-  await saveState(state);
-  if (GIT_PERSIST) await persistStateGit();
+  if (changedAnything) {
+    await saveState(state);
+    console.log("state file updated");
+  }
 })();
