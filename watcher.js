@@ -24,8 +24,7 @@ async function renderChar(nick) {
 
   const context = await browser.newContext({
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     locale: "pt-BR",
     extraHTTPHeaders: {
       "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -36,56 +35,87 @@ async function renderChar(nick) {
 
   const page = await context.newPage();
 
-  // bloqueia imagens e fontes pra acelerar
+  // bloqueia imagens e fontes p/ acelerar
   await page.route("**/*", (route) => {
-    const type = route.request().resourceType();
-    if (type === "image" || type === "font") return route.abort();
+    const t = route.request().resourceType();
+    if (t === "image" || t === "font") return route.abort();
     return route.continue();
   });
 
   const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
 
-  // helper: detecta tela de proteção
-  const isAntiBot = async () => {
-    const html = await page.content();
-    return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(html);
+  // helpers --------------------------------------------------
+  const closeCookieBanner = async () => {
+    // 1) direto no DOM
+    const tryClick = async (sel) => {
+      try { await page.locator(sel).first().click({ timeout: 1500 }); return true; } catch { return false; }
+    };
+    if (await tryClick('button:has-text("Permitir todos")')) return true;
+    if (await tryClick('button:has-text("Rejeitar")')) return true;
+    if (await tryClick('text=Permitir todos')) return true;
+    if (await tryClick('text=Rejeitar')) return true;
+
+    // 2) alguns Cookiebot vêm em iframe (Usercentrics)
+    const frames = page.frames();
+    for (const f of frames) {
+      try {
+        if (/usercentrics|consent|cookiebot/i.test(f.url())) {
+          const btn = f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first();
+          await btn.click({ timeout: 1500 });
+          return true;
+        }
+      } catch {}
+    }
+    return false;
   };
 
-  const gotoOnce = async () => {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    // tenta esperar label de localização ou status
-    const locLabel = page.locator("span", { hasText: /Localiza(ç|c)ão:/i });
-    try {
-      await locLabel.first().waitFor({ timeout: 20000 });
-    } catch {
-      const hasStatus = page.locator("span", { hasText: /Status:/i });
-      await Promise.race([
-        hasStatus.first().waitFor({ timeout: 8000 }),
-        page.waitForTimeout(8000)
-      ]);
+  const switchTo50x = async () => {
+    // procura botões/links visíveis com "50x" ou "x50"
+    const candidates = [
+      'a:has-text("50x")', 'button:has-text("50x")',
+      'a:has-text("x50")', 'button:has-text("x50")',
+      'a:has-text("50 X")', 'button:has-text("50 X")'
+    ];
+    for (const sel of candidates) {
+      const loc = page.locator(sel);
+      if (await loc.count().catch(() => 0)) {
+        try {
+          await loc.first().click({ timeout: 1500 });
+          await page.waitForTimeout(800); // deixa aplicar o filtro/versão
+          return true;
+        } catch {}
+      }
     }
+    // fallback: tentar via script
+    await page.evaluate(() => {
+      const all = Array.from(document.querySelectorAll("a,button"));
+      const el = all.find(e => /(^|\s)(50x|x50)(\s|$)/i.test((e.textContent||"").trim()));
+      if (el) (el).click();
+    }).catch(() => {});
+    await page.waitForTimeout(600);
+    return true;
   };
+  // ----------------------------------------------------------
 
   try {
-    // primeira tentativa
-    await gotoOnce();
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-    // se bateu challenge do Cloudflare
-    if (await isAntiBot()) {
-      await page.waitForTimeout(8000);
-      await gotoOnce();
-    }
+    // fecha cookie banner se aparecer
+    await closeCookieBanner().catch(() => {});
+    // garante versão 50x (se houver toggle)
+    await switchTo50x().catch(() => {});
 
-    // extrair dados
+    // pequena espera pro conteúdo montar
+    await page.waitForTimeout(1200);
+
+    // extração mais tolerante (sem depender de visibilidade)
     const data = await page.evaluate(() => {
       const findByLabel = (labelRe) => {
         const spans = Array.from(document.querySelectorAll("span"));
         for (let i = 0; i < spans.length; i++) {
           const t = (spans[i].textContent || "").trim();
           if (labelRe.test(t)) {
-            const next =
-              spans[i].parentElement?.querySelectorAll("span")?.[1] ||
-              spans[i].nextElementSibling;
+            const next = spans[i].parentElement?.querySelectorAll("span")?.[1] || spans[i].nextElementSibling;
             if (next?.tagName?.toLowerCase() === "span") {
               const val = (next.textContent || "").trim();
               if (val) return val;
@@ -96,20 +126,14 @@ async function renderChar(nick) {
       };
 
       const statusFromLabel = (() => {
-        const containers = Array.from(
-          document.querySelectorAll("div,li,section,article")
-        );
+        const containers = Array.from(document.querySelectorAll("div,li,section,article"));
         for (const c of containers) {
           if (/Status:/i.test(c.textContent || "")) {
-            const img = c.querySelector(
-              'img[alt="Online"], img[alt="Offline"]'
-            );
+            const img = c.querySelector('img[alt="Online"], img[alt="Offline"]');
             if (img && img.getAttribute("alt")) return img.getAttribute("alt");
           }
         }
-        const any = document.querySelector(
-          'img[alt="Online"], img[alt="Offline"]'
-        );
+        const any = document.querySelector('img[alt="Online"], img[alt="Offline"]');
         return any ? any.getAttribute("alt") : null;
       })();
 
@@ -126,14 +150,10 @@ async function renderChar(nick) {
     return data;
   } catch (e) {
     await browser.close();
-    return {
-      ok: false,
-      status: "—",
-      location: "—",
-      error: e.message || String(e)
-    };
+    return { ok: false, status: "—", location: "—", error: e.message || String(e) };
   }
 }
+
 
 // ======================
 // utilitários de lista/estado
