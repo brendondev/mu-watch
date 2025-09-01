@@ -1,7 +1,22 @@
 {
   "enrev": {
     "status": "Offline",
-    "location": "Loren Market",
-    "updatedAt": 1756770896390
+    "location": "—",
+    "updatedAt": 1756771108251
+  },
+  "katez": {
+    "status": "Online",
+    "location": "—",
+    "updatedAt": 1756771089203
+  },
+  "yeiyeii": {
+    "status": "Online",
+    "location": "—",
+    "updatedAt": 1756771098875
+  },
+  "wuysss": {
+    "status": "Offline",
+    "location": "—",
+    "updatedAt": 1756771118374
   }
 }
