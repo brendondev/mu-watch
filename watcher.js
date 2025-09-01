@@ -67,50 +67,63 @@ async function renderChar(nick) {
     return false;
   };
 
-  // abre X-5 e seleciona X-50; confirma que X-50 ficou selecionado
+// abre o grupo "X - 5" (se necessário) e clica no item list "X - 50" (SideMenuServers_list-item__...)
+// confirma seleção; repete até 4 tentativas
 const ensure50x = async () => {
-  const tryDomSwitch = async () => {
+  // faz tudo no DOM para evitar timing de visibilidade
+  const tryOnce = async () => {
     return await page.evaluate(() => {
-      const byText = (root, re) => {
-        const els = root.querySelectorAll('div[class*="SideMenuServers_item"]');
-        for (const el of els) {
-          const txt = (el.textContent || "").trim();
-          if (re.test(txt)) return el;
-        }
-        return null;
-      };
+      const hasClassPart = (el, part) =>
+        !!Array.from((el.className || "").toString().split(/\s+/)).find(c => c.includes(part));
 
-      // 1) abrir/expandir grupo X - 5 (se tiver botão de expandir)
-      const groupX5 = byText(document, /\bX\s*-\s*5\b/i);
-      if (groupX5) {
-        const btn = groupX5.querySelector('svg[class*="open-btn"]');
-        (btn || groupX5).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      // 1) encontrar container de lista/side menu pra poder rolar
+      const side = Array.from(document.querySelectorAll("div"))
+        .find(d => Array.from(d.querySelectorAll("div")).some(x => hasClassPart(x, "SideMenuServers_item")));
+      if (side) side.scrollTop = 0;
+
+      // 2) garantir que o grupo X - 5 está expandido (se tiver botão)
+      const groups = Array.from(document.querySelectorAll('div'))
+        .filter(el => hasClassPart(el, "SideMenuServers_item") && /\bX\s*-\s*5\b/i.test((el.textContent||"").trim()));
+      if (groups.length) {
+        const g = groups[0];
+        const btn = g.querySelector('svg[class*="open-btn"]');
+        if (btn) btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        else g.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       }
 
-      // 2) clicar item X - 50
-      const item50 = byText(document, /\bX\s*-\s*50\b/i);
-      if (item50) {
-        item50.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      // 3) clicar no list-item X - 50 (classe: SideMenuServers_list-item__)
+      const listItems = Array.from(document.querySelectorAll('div'))
+        .filter(el => hasClassPart(el, "SideMenuServers_list-item") && /\bX\s*-\s*50\b/i.test((el.textContent||"").trim()));
+
+      // caso não ache list-item, tenta qualquer item com texto X - 50
+      const targets = listItems.length ? listItems : Array.from(document.querySelectorAll('div'))
+        .filter(el => hasClassPart(el, "SideMenuServers_item") && /\bX\s*-\s*50\b/i.test((el.textContent||"").trim()));
+
+      if (targets.length) {
+        const t = targets[0];
+        // rola até ele
+        t.scrollIntoView({ block: "center", inline: "nearest" });
+        // clica nele
+        t.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       }
 
-      // 3) checar selecionado
+      // 4) verificar selecionado
       const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
-      const selText = (sel?.textContent || "").trim();
-      return {
-        selectedIs50: /\bX\s*-\s*50\b/i.test(selText),
-        selectedText: selText
-      };
+      const selText = (sel?.textContent || "").replace(/\s+/g, "");
+      const is50 = /X-50/i.test(selText); // normaliza sem espaços
+      return { is50, selText };
     });
   };
 
-  let ok = false, last = { selectedIs50: false, selectedText: "" };
-  for (let i = 0; i < 3; i++) {
-    last = await tryDomSwitch();
-    if (last.selectedIs50) { ok = true; break; }
-    await page.waitForTimeout(600);
+  let ok = false, last = { is50: false, selText: "" };
+  for (let i = 0; i < 4; i++) {
+    last = await tryOnce();
+    if (last.is50) { ok = true; break; }
+    await page.waitForTimeout(700);
   }
-  console.log("selected 50x:", ok, "selectedText:", last.selectedText);
+  console.log("selected 50x:", ok, "selectedText:", last.selText);
 };
+
 
 
   const isAntiBot = async () => {
