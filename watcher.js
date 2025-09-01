@@ -1,21 +1,21 @@
+// watcher v3 (no waitFor on locators)
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
 
 const BASE = process.env.MU_BASE_URL || "https://mudream.online";
 const PATH = process.env.MU_CHAR_PATH || "/pt/char/";
-const WEBHOOK = process.env.DISCORD_WEBHOOK_URL; // obrig.
+const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
+
+console.log("watcher version v3"); // imprime no log da Action
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL ausente");
   process.exit(1);
 }
 
-// ======================
-// Função principal renderChar
-// ======================
 async function renderChar(nick) {
   const browser = await chromium.launch({
     headless: true,
@@ -35,7 +35,7 @@ async function renderChar(nick) {
 
   const page = await context.newPage();
 
-  // bloqueia imagens/fontes p/ acelerar
+  // Bloqueia imagens/fontes (rápido e evita bloqueios bobos)
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "font") return route.abort();
@@ -44,10 +44,10 @@ async function renderChar(nick) {
 
   const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
 
-  // --- helpers ------------------------------------------------
+  // Helpers ---------------------------------------------------
   const closeCookieBanner = async () => {
     const tryClick = async (sel) => {
-      try { await page.locator(sel).first().click({ timeout: 800 }); return true; } catch { return false; }
+      try { await page.locator(sel).first().click({ timeout: 500 }); return true; } catch { return false; }
     };
     if (await tryClick('button:has-text("Permitir todos")')) return true;
     if (await tryClick('button:has-text("Rejeitar")')) return true;
@@ -58,8 +58,8 @@ async function renderChar(nick) {
     for (const f of page.frames()) {
       try {
         if (/usercentrics|consent|cookiebot/i.test(f.url())) {
-          const b = f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first();
-          await b.click({ timeout: 800 });
+          const btn = f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first();
+          await btn.click({ timeout: 700 });
           return true;
         }
       } catch {}
@@ -72,16 +72,13 @@ async function renderChar(nick) {
       const group = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 5")').first();
       if (await group.count()) {
         const openBtn = group.locator('svg[class*="open-btn"]');
-        if (await openBtn.count()) {
-          await openBtn.first().click({ timeout: 800 }).catch(()=>{});
-        } else {
-          await group.click({ timeout: 800 }).catch(()=>{});
-        }
-        await page.waitForTimeout(400);
+        if (await openBtn.count()) { await openBtn.first().click({ timeout: 600 }).catch(()=>{}); }
+        else { await group.click({ timeout: 600 }).catch(()=>{}); }
+        await page.waitForTimeout(350);
       }
       const x50 = page.locator('div[class*="SideMenuServers_item"]:has-text("X - 50")').first();
-      await x50.click({ timeout: 1200 }).catch(()=>{});
-      await page.waitForTimeout(600);
+      await x50.click({ timeout: 1000 }).catch(()=>{});
+      await page.waitForTimeout(500);
     } catch {}
   };
 
@@ -109,7 +106,6 @@ async function renderChar(nick) {
         return null;
       };
 
-      // status: preferir img perto do bloco que contém "Status:"
       const statusFromLabel = (() => {
         const containers = Array.from(document.querySelectorAll("div,li,section,article"));
         for (const c of containers) {
@@ -131,23 +127,19 @@ async function renderChar(nick) {
       };
     });
   };
-  // ------------------------------------------------------------
+  // -----------------------------------------------------------
 
   try {
-    // navega sem networkidle
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-    // fecha cookies e força 50x
     await closeCookieBanner().catch(()=>{});
     await switchTo50x().catch(()=>{});
 
     // dá tempo pra SPA montar
     await page.waitForTimeout(1500);
 
-    // 1ª extração
     let data = await extract();
 
-    // se anti-bot, espera e tenta de novo
     if (!data.ok && (await isAntiBot())) {
       await page.waitForTimeout(8000);
       await closeCookieBanner().catch(()=>{});
@@ -164,26 +156,16 @@ async function renderChar(nick) {
   }
 }
 
-
-
-// ======================
-// utilitários de lista/estado
-// ======================
 async function loadList() {
   try {
     const t = await fs.readFile(WATCHLIST_FILE, "utf8");
     return t.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 async function loadState() {
-  try {
-    return JSON.parse(await fs.readFile(STATE_FILE, "utf8"));
-  } catch {
-    return {};
-  }
+  try { return JSON.parse(await fs.readFile(STATE_FILE, "utf8")); }
+  catch { return {}; }
 }
 
 async function saveState(obj) {
@@ -198,23 +180,15 @@ async function postDiscord(content) {
   });
 }
 
-// ======================
-// main loop
-// ======================
 (async () => {
   const list = await loadList();
-  if (!list.length) {
-    console.log("watchlist vazia");
-    return;
-  }
+  if (!list.length) { console.log("watchlist vazia"); return; }
   const state = await loadState();
 
   for (const nick of list) {
     const cur = await renderChar(nick);
-    if (!cur.ok) {
-      console.log(`falha ${nick}: ${cur.error || "sem dados"}`);
-      continue;
-    }
+    if (!cur.ok) { console.log(`falha ${nick}: ${cur.error || "sem dados"}`); continue; }
+
     const prev = state[nick] || {};
     const changed = prev.status !== cur.status || prev.location !== cur.location;
 
