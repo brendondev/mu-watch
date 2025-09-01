@@ -1,4 +1,4 @@
-// watcher v16 — restore X-50 selection + header-anchored status/location + state persistence
+// watcher v17 — fixa seleção X-50 via DOM (sem waitForSelector) + header-anchored status/location + state
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import path from "path";
@@ -10,14 +10,10 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 
-console.log("watcher version v16");
+console.log("watcher version v17");
+if (!WEBHOOK) { console.error("DISCORD_WEBHOOK_URL ausente"); process.exit(1); }
 
-if (!WEBHOOK) {
-  console.error("DISCORD_WEBHOOK_URL is missing");
-  process.exit(1);
-}
-
-/* ------------------------- FS + Discord utils ------------------------- */
+/* ------------------ FS & Discord ------------------ */
 async function ensureDirOf(filePath) {
   const dir = path.dirname(path.resolve(filePath));
   await fs.mkdir(dir, { recursive: true }).catch(() => {});
@@ -44,7 +40,7 @@ async function postDiscord(content) {
   });
 }
 
-/* ---------------------------- Scraping core --------------------------- */
+/* ------------------ Scraper core ------------------ */
 async function renderChar(nick) {
   const browser = await chromium.launch({
     headless: true,
@@ -64,18 +60,18 @@ async function renderChar(nick) {
 
   const page = await context.newPage();
 
-  // speed-up (alt/src remains in DOM)
-  await page.route("**/*", route => {
+  // Acelera: não carregar fontes/imagens (o <img> com alt/src ainda fica no DOM)
+  await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "font" || t === "image") return route.abort();
-    return route.continue();
+    route.continue();
   });
 
   const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
 
   const closeCookieBanner = async () => {
-    const tryClick = async sel => {
-      try { await page.locator(sel).first().click({ timeout: 700 }); return true; } catch { return false; }
+    const tryClick = async (sel) => {
+      try { await page.locator(sel).first().click({ timeout: 500 }); return true; } catch { return false; }
     };
     if (await tryClick('button:has-text("Permitir todos")')) return;
     if (await tryClick('button:has-text("Rejeitar")')) return;
@@ -84,66 +80,90 @@ async function renderChar(nick) {
     for (const f of page.frames()) {
       try {
         if (/usercentrics|consent|cookiebot/i.test(f.url())) {
-          await f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first().click({ timeout: 800 });
+          await f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first().click({ timeout: 700 });
           return;
         }
       } catch {}
     }
   };
 
-  // robust “open X-5/CLASSIC” -> click “GUILDWAR” -> confirm selected shows GUILDWAR
+  // Seleciona X-50 (“GUILDWAR”) usando somente DOM/dispatchEvent, com tentativas
   const ensureX50 = async () => {
-    for (let attempt = 1; attempt <= 4; attempt++) {
-      try {
-        // make sure left menu exists
-        await page.waitForSelector('div[class*="SideMenuServers_item"]', { timeout: 3000 });
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      const ok = await page.evaluate(() => {
+        const norm = (s) => (s || "").replace(/\s+/g, "").toUpperCase();
+        const normSp = (s) => (s || "").toUpperCase();
 
-        // open group (CLASSIC / X - 5)
-        const classic = page.locator('div[class*="SideMenuServers_item"]', { hasText: /CLASSIC|X\s*-\s*5/i }).first();
-        await classic.scrollIntoViewIfNeeded().catch(() => {});
-        // try chevron, otherwise click the block
-        const chevron = classic.locator('svg[class*="open-btn"]').first();
-        if (await chevron.count()) {
-          await chevron.click({ force: true, timeout: 1200 }).catch(()=>{});
-        } else {
-          await classic.click({ force: true, timeout: 1200 }).catch(()=>{});
+        // 1) pega o item selecionado atual (normalmente CLASSIC / X-5)
+        const selected = document.querySelector('div[class*="SideMenuServers_selected"]') ||
+                         document.querySelector('div[class*="SideMenuServers_item"]');
+
+        // função segura de clique
+        const safeClick = (el) => {
+          try {
+            el.scrollIntoView({ block: "center", inline: "center" });
+            el.style.removeProperty("display");
+            el.style.visibility = "visible";
+            el.style.opacity = "1";
+            const evt = new MouseEvent("click", { bubbles: true, cancelable: true, view: window });
+            el.dispatchEvent(evt);
+            return true;
+          } catch { return false; }
+        };
+
+        // já está em GUILDWAR?
+        const selectedTxt = norm(selected?.textContent || "");
+        if (/GUILDWAR|X-50/.test(selectedTxt)) return true;
+
+        // 2) tenta abrir o grupo (chevron)
+        if (selected) {
+          const chevron = selected.querySelector('svg[class*="open-btn"]');
+          if (chevron) safeClick(chevron);
+          safeClick(selected);
         }
-        await page.waitForTimeout(400);
 
-        // click GUILDWAR option (X - 50)
-        const gw = page.locator('div[class*="SideMenuServers_item"], div[class*="SideMenuServers_list-item"]', { hasText: /GUILDWAR|X\s*-\s*50/i }).first();
-        await gw.scrollIntoViewIfNeeded().catch(()=>{});
-        await gw.click({ force: true, timeout: 2000 }).catch(()=>{});
-        await page.waitForTimeout(700);
+        // 3) procura o item "GUILDWAR" ou “X - 50”
+        const items = Array.from(document.querySelectorAll('div[class*="SideMenuServers_item"], div[class*="SideMenuServers_list-item"]'));
+        const target = items.find(el => /GUILDWAR/.test(norm(el.textContent || "")) || /X-50/.test(norm(el.textContent || "")) || /X\s*-\s*50/.test(normSp(el.textContent || "")));
+        if (target) {
+          safeClick(target);
+        }
 
-        // confirm selected label
-        const selectedText = (await page.locator('div[class*="SideMenuServers_selected"]').first().innerText().catch(()=>"" )) || "";
-        const normalized = selectedText.replace(/\s+/g, "").toUpperCase();
-        console.log(`ensureX50 attempt ${attempt} → selected: ${normalized}`);
-        if (/GUILDWAR|X-50/.test(normalized)) return;
-      } catch (e) {
-        console.log(`ensureX50 attempt ${attempt} error: ${e?.message || e}`);
-      }
-      await page.waitForTimeout(500);
+        // 4) checa novamente o selecionado
+        const selNow = document.querySelector('div[class*="SideMenuServers_selected"]') || selected;
+        const txt = norm(selNow?.textContent || "");
+        return /GUILDWAR|X-50/.test(txt);
+      });
+
+      const selText = await page.evaluate(() => {
+        const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+        return (sel?.textContent || "").replace(/\s+/g, "");
+      });
+      console.log(`ensureX50 attempt ${attempt} → selected: ${selText}`);
+
+      if (ok) return true;
+      await page.waitForTimeout(500 + attempt * 150);
     }
+    return false;
   };
 
   const extractHeader = async (nickLower) => {
     return await page.evaluate((nickLower_) => {
       const norm = (s) => (s || "").trim().toLowerCase();
 
-      // 1) find <b>nick</b> in header
-      const b = Array.from(document.querySelectorAll("b")).find(el => norm(el.textContent) === nickLower_);
-      if (!b) return { ok: false, status: null, location: null, reason: "nick-not-found" };
+      // 1) <b>nick</b>
+      const bNick = Array.from(document.querySelectorAll("b"))
+        .find(b => norm(b.textContent) === nickLower_);
+      if (!bNick) return { ok: false, status: null, location: null, reason: "nick-not-found" };
 
-      // 2) get header container
-      const header = b.closest('[class*="CharPage_char-header"]') ||
-                     b.closest('[class*="CharPage_name-block"]') ||
-                     b.parentElement;
+      // 2) header
+      const header = bNick.closest('[class*="CharPage_char-header"]') ||
+                     bNick.closest('[class*="CharPage_name-block"]') ||
+                     bNick.parentElement;
 
       if (!header) return { ok: false, status: null, location: null, reason: "header-not-found" };
 
-      // 3) status icon near nick
+      // 3) status (ícone ao lado do nick)
       let status = null;
       const sImg = header.querySelector('img[alt="Online"], img[alt="Offline"]') ||
                    header.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
@@ -157,22 +177,21 @@ async function renderChar(nick) {
         }
       }
 
-      // 4) location inside the same header block (CharPage_char-info…)
+      // 4) location (par de spans dentro do bloco info do header)
       let location = null;
-      const infoBlock = header.querySelector('[class*="CharPage_char-info"]') || header;
-      const spans = Array.from(infoBlock.querySelectorAll("span"));
+      const info = header.querySelector('[class*="CharPage_char-info"]') || header;
+      const spans = Array.from(info.querySelectorAll("span"));
       for (let i = 0; i < spans.length; i++) {
         const t = (spans[i].textContent || "").trim();
         if (/^Localiza(?:ç|c)ão:$/i.test(t) || /^Location:$/i.test(t)) {
-          const next = spans[i].nextElementSibling;
-          if (next && next.tagName?.toLowerCase() === "span") {
-            location = (next.textContent || "").trim();
+          const sib = spans[i].nextElementSibling;
+          if (sib && sib.tagName?.toLowerCase() === "span") {
+            location = (sib.textContent || "").trim();
             break;
           }
-          // fallback: second span in same parent
-          const sibs = spans[i].parentElement?.querySelectorAll("span");
-          if (sibs && sibs.length >= 2) {
-            location = (sibs[1].textContent || "").trim();
+          const inParent = spans[i].parentElement?.querySelectorAll("span");
+          if (inParent && inParent.length >= 2) {
+            location = (inParent[1].textContent || "").trim();
             break;
           }
         }
@@ -188,17 +207,18 @@ async function renderChar(nick) {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await closeCookieBanner().catch(()=>{});
 
-    // ensure side menu is ready, then force X-50
-    await page.waitForTimeout(600);
-    await ensureX50().catch(()=>{});
+    // tenta forçar X-50 pelo DOM, sem travar a execução se falhar
+    await page.waitForTimeout(700);
+    const switched = await ensureX50().catch(()=>false);
+    console.log(`X-50 switched: ${!!switched}`);
 
-    // let SPA hydrate header
-    await page.waitForSelector('div[class*="CharPage_char-header"]', { timeout: 6000 }).catch(()=>{});
-    await page.waitForTimeout(900);
+    // tempo para header hidratar
+    await page.waitForTimeout(1200);
 
+    // captura a partir do header do nick
     let data = await extractHeader(nick.trim().toLowerCase());
     if (!data.ok) {
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(1000);
       data = await extractHeader(nick.trim().toLowerCase());
     }
 
@@ -210,14 +230,14 @@ async function renderChar(nick) {
   }
 }
 
-/* ------------------------------ Main loop ----------------------------- */
+/* ------------------ Main loop ------------------ */
 (async () => {
   const list = await loadList();
-  if (!list.length) { console.log("watchlist is empty"); return; }
+  if (!list.length) { console.log("watchlist vazia"); return; }
 
   let state = await loadState();
   if (!state || typeof state !== "object") state = {};
-  await saveState(state); // make sure file exists
+  await saveState(state); // garante existência
 
   let changedAnything = false;
 
@@ -226,26 +246,26 @@ async function renderChar(nick) {
     if (!nick) continue;
 
     const cur = await renderChar(nick);
-    if (!cur.ok) { console.log(`fail ${nick}: ${cur.error || "no data"}`); continue; }
+    if (!cur.ok) { console.log(`falha ${nick}: ${cur.error || "sem dados"}`); continue; }
 
     const prev = state[nick] || {};
     const changed = prev.status !== cur.status || prev.location !== cur.location;
 
-    // persist current snapshot
+    // salva snapshot atual SEMPRE
     state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
     changedAnything ||= changed;
 
     if (changed) {
       const msg = [`**${nick}**`, `• Status: ${cur.status}`, `• Location: ${cur.location}`].join("\n");
       await postDiscord(msg);
-      console.log(`notified ${nick}: ${cur.status} / ${cur.location}`);
+      console.log(`notificado ${nick}: ${cur.status} / ${cur.location}`);
     } else {
-      console.log(`no change ${nick}: ${cur.status} / ${cur.location}`);
+      console.log(`sem mudança ${nick}: ${cur.status} / ${cur.location}`);
     }
   }
 
   if (changedAnything) {
     await saveState(state);
-    console.log("state file updated");
+    console.log("state.json atualizado");
   }
 })();
