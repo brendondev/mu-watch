@@ -67,62 +67,55 @@ async function renderChar(nick) {
     return false;
   };
 
-// abre o grupo "X - 5" (se necessário) e clica no item list "X - 50" (SideMenuServers_list-item__...)
-// confirma seleção; repete até 4 tentativas
+// Abre o item selecionado "CLASSIC" e clica no list-item "GUILDWAR".
+// Confirma que o selecionado contém "GUILDWAR". Tenta até 4 vezes.
 const ensure50x = async () => {
-  // faz tudo no DOM para evitar timing de visibilidade
   const tryOnce = async () => {
     return await page.evaluate(() => {
       const hasClassPart = (el, part) =>
-        !!Array.from((el.className || "").toString().split(/\s+/)).find(c => c.includes(part));
+        !!(el && el.className && el.className.toString().split(/\s+/).some(c => c.includes(part)));
 
-      // 1) encontrar container de lista/side menu pra poder rolar
-      const side = Array.from(document.querySelectorAll("div"))
-        .find(d => Array.from(d.querySelectorAll("div")).some(x => hasClassPart(x, "SideMenuServers_item")));
-      if (side) side.scrollTop = 0;
+      const isMenuItem = (el) => hasClassPart(el, "SideMenuServers_item");
 
-      // 2) garantir que o grupo X - 5 está expandido (se tiver botão)
-      const groups = Array.from(document.querySelectorAll('div'))
-        .filter(el => hasClassPart(el, "SideMenuServers_item") && /\bX\s*-\s*5\b/i.test((el.textContent||"").trim()));
-      if (groups.length) {
-        const g = groups[0];
-        const btn = g.querySelector('svg[class*="open-btn"]');
-        if (btn) btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-        else g.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      // 1) pegar o item atualmente selecionado (SideMenuServers_selected...)
+      const selected = document.querySelector('div[class*="SideMenuServers_selected"]');
+
+      // 1a) se o selecionado é o grupo "CLASSIC", clicar pra expandir (botão open-btn ou no próprio item)
+      if (selected && /CLASSIC/i.test((selected.textContent || ""))) {
+        const openBtn = selected.querySelector('svg[class*="open-btn"]');
+        (openBtn || selected)?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       }
 
-      // 3) clicar no list-item X - 50 (classe: SideMenuServers_list-item__)
-      const listItems = Array.from(document.querySelectorAll('div'))
-        .filter(el => hasClassPart(el, "SideMenuServers_list-item") && /\bX\s*-\s*50\b/i.test((el.textContent||"").trim()));
+      // 2) procurar o list-item "GUILDWAR" (classe SideMenuServers_list-item__)
+      const allDivs = Array.from(document.querySelectorAll("div"));
+      const guildwarItem =
+        allDivs.find(el => isMenuItem(el) && hasClassPart(el, "SideMenuServers_list-item") && /GUILDWAR/i.test((el.textContent || ""))) ||
+        allDivs.find(el => isMenuItem(el) && /GUILDWAR/i.test((el.textContent || ""))); // fallback
 
-      // caso não ache list-item, tenta qualquer item com texto X - 50
-      const targets = listItems.length ? listItems : Array.from(document.querySelectorAll('div'))
-        .filter(el => hasClassPart(el, "SideMenuServers_item") && /\bX\s*-\s*50\b/i.test((el.textContent||"").trim()));
-
-      if (targets.length) {
-        const t = targets[0];
-        // rola até ele
-        t.scrollIntoView({ block: "center", inline: "nearest" });
-        // clica nele
-        t.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      if (guildwarItem) {
+        guildwarItem.scrollIntoView({ block: "center", inline: "nearest" });
+        guildwarItem.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       }
 
-      // 4) verificar selecionado
+      // 3) verificar o novo selecionado
       const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
-      const selText = (sel?.textContent || "").replace(/\s+/g, "");
-      const is50 = /X-50/i.test(selText); // normaliza sem espaços
-      return { is50, selText };
+      const selText = (sel?.textContent || "").replace(/\s+/g, "").toUpperCase();
+      const ok = /GUILDWAR/.test(selText);
+      return { ok, selText };
     });
   };
 
-  let ok = false, last = { is50: false, selText: "" };
+  let ok = false, last = { ok: false, selText: "" };
   for (let i = 0; i < 4; i++) {
     last = await tryOnce();
-    if (last.is50) { ok = true; break; }
+    if (last.ok) { ok = true; break; }
     await page.waitForTimeout(700);
   }
-  console.log("selected 50x:", ok, "selectedText:", last.selText);
+  console.log("selected GUILDWAR:", ok, "selectedText:", last.selText);
 };
+
+
+  /*acaba aq*/
 
 
 
