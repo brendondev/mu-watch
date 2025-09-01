@@ -1,7 +1,11 @@
-// watcher v5 (seleção X-50 via menu de seta; status via alt/src)
+// watcher v6 (location robusta + persistência do state por git opcional)
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
+import { exec as _exec } from "child_process";
+import { promisify } from "util";
+
+const exec = promisify(_exec);
 
 const BASE = process.env.MU_BASE_URL || "https://mudream.online";
 const PATH = process.env.MU_CHAR_PATH || "/pt/char/";
@@ -9,7 +13,12 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 
-console.log("watcher version v5");
+// persistência via git (set no workflow)
+const GIT_PERSIST = process.env.GIT_PERSIST === "1";
+const GIT_USER_NAME = process.env.GIT_USER_NAME || "bot";
+const GIT_USER_EMAIL = process.env.GIT_USER_EMAIL || "bot@users.noreply.github.com";
+
+console.log("watcher version v6");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL ausente");
@@ -32,8 +41,9 @@ async function renderChar(nick) {
     viewport: { width: 1366, height: 768 },
   });
   const page = await context.newPage();
-  // bloqueia imagens/fontes (reduz carga; ícone ainda está no DOM)
-  await page.route("**/*", route => {
+
+  // bloqueia imagens/fontes (o <img> fica no DOM com alt/src)
+  await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (t === "image" || t === "font") return route.abort();
     return route.continue();
@@ -41,9 +51,9 @@ async function renderChar(nick) {
 
   const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
 
-  // fecha banner de cookies
+  // --- helpers ---
   const closeCookieBanner = async () => {
-    const tryClick = async sel => {
+    const tryClick = async (sel) => {
       try {
         await page.locator(sel).first().click({ timeout: 700 });
         return true;
@@ -55,6 +65,7 @@ async function renderChar(nick) {
     if (await tryClick('button:has-text("Rejeitar")')) return true;
     if (await tryClick('text=Permitir todos')) return true;
     if (await tryClick('text=Rejeitar')) return true;
+
     for (const frame of page.frames()) {
       try {
         if (/usercentrics|consent|cookiebot/i.test(frame.url())) {
@@ -69,123 +80,175 @@ async function renderChar(nick) {
     return false;
   };
 
-  // abre a seta do menu e escolhe GUILDWAR; confirma o selecionado
+  // abre a seta e escolhe GUILDWAR; confirma
   const ensureX50 = async () => {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        // clica na seta (open-btn) para abrir o menu
         const arrow = page.locator('svg.SideMenuServers_open-btn__Rsa_X').first();
-        await arrow.waitFor({ timeout: 1500 });
+        await arrow.waitFor({ timeout: 2000 });
         await arrow.click({ force: true, timeout: 1500 });
-        // aguarda e clica em “GUILDWAR”
+
         const guildOption = page
           .locator('div.SideMenuServers_list-item__qzJXK', { hasText: "GUILDWAR" })
           .first();
-        await guildOption.waitFor({ timeout: 2000 });
+        await guildOption.waitFor({ timeout: 2500 });
         await guildOption.click({ force: true, timeout: 1500 });
-        // espera a seleção atualizar
+
         await page.waitForTimeout(3000);
-        // confere o texto do item selecionado
+
         const selText = await page
           .locator('div.SideMenuServers_selected__zYRfa')
           .first()
-          .innerText();
-        const normalized = selText.replace(/\s+/g, "").toUpperCase();
-        console.log(
-          `ensureX50 attempt ${attempt} → selected: ${normalized}`,
-        );
+          .innerText()
+          .catch(() => "");
+        const normalized = (selText || "").replace(/\s+/g, "").toUpperCase();
+        console.log(`ensureX50 → selected: ${normalized}`);
         if (/GUILDWAR/.test(normalized)) return;
       } catch (e) {
+        console.log("ensureX50 error:", e?.message || e);
       }
     }
   };
 
-  // detecta anti-bot
   const isAntiBot = async () => {
     const html = await page.content();
     return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(html);
   };
 
-  // extrai status via alt/src e localização via rótulo
+  // EXTRAÇÃO ROBUSTA (localização + status)
   const extract = async () => {
     return await page.evaluate(() => {
-      const findByLabel = re => {
-        const spans = Array.from(document.querySelectorAll("span"));
-        for (let i = 0; i < spans.length; i++) {
-          const t = (spans[i].textContent || "").trim();
-          if (re.test(t)) {
-            const next =
-              spans[i].parentElement?.querySelectorAll("span")?.[1] ||
-              spans[i].nextElementSibling;
-            if (next?.tagName?.toLowerCase() === "span") {
-              const val = (next.textContent || "").trim();
-              if (val) return val;
+      const norm = (s) =>
+        (s || "")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+      // ===== Localização =====
+      let location = null;
+
+      // Varre containers plausíveis que contenham "Localização:"
+      const containers = Array.from(document.querySelectorAll("div,section,article,li"));
+      for (const el of containers) {
+        const txtNorm = norm(el.textContent);
+        if (!/Localizacao:/i.test(txtNorm)) continue;
+
+        // 1) spans: label exato + próximo span
+        const spans = Array.from(el.querySelectorAll("span"));
+        if (spans.length) {
+          // (a) label exato + próximo índice
+          let idx = spans.findIndex((s) => /^Localiza(c|ç)ao:$/i.test(norm(s.textContent)));
+          if (idx >= 0) {
+            const next = spans[idx + 1];
+            const val = next && norm(next.textContent);
+            if (val) {
+              location = (next.textContent || "").trim();
+              break;
+            }
+          }
+          // (b) fallback: primeiro span depois de um que contenha o label
+          if (!location) {
+            for (let i = 0; i < spans.length - 1; i++) {
+              if (/^Localiza(c|ç)ao:$/i.test(norm(spans[i].textContent))) {
+                const val = (spans[i + 1].textContent || "").trim();
+                if (val) {
+                  location = val;
+                  break;
+                }
+              }
+            }
+            if (location) break;
+          }
+          // (c) último span do mesmo container (alguns layouts colocam o valor no fim)
+          if (!location) {
+            const last = spans[spans.length - 1];
+            const val = (last?.textContent || "").trim();
+            const hasLabel = spans.some((s) => /Localiza(c|ç)ao:/i.test(norm(s.textContent)));
+            if (hasLabel && val && !/Localiza(c|ç)ao:/i.test(norm(val))) {
+              location = val;
+              break;
             }
           }
         }
-        return null;
-      };
-      // status pelo alt ou src
-      const statusFromImg = (() => {
-        const img =
-          document.querySelector('img[alt="Online"], img[alt="Offline"]') ||
-          document.querySelector(
-            'img[src*="/assets/images/online"], img[src*="/assets/images/offline"]',
-          );
-        if (!img) return null;
+
+        // 2) Fallback textual dentro do container
+        if (!location) {
+          const raw = (el.textContent || "").split(/Localiza(?:ção|cao):/i)[1];
+          if (raw) {
+            const val = raw.replace(/^[\s:\-]+/, "").split(/\n| {2,}|\t/)[0].trim();
+            if (val) {
+              location = val;
+              break;
+            }
+          }
+        }
+      }
+
+      // ===== Status (ícone Online/Offline) =====
+      let status = null;
+      const img =
+        document.querySelector('img[alt="Online"], img[alt="Offline"]') ||
+        document.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
+      if (img) {
         const alt = img.getAttribute("alt");
-        if (alt) return alt;
-        const src = img.getAttribute("src") || "";
-        if (/online\.png/i.test(src)) return "Online";
-        if (/offline\.png/i.test(src)) return "Offline";
-        return null;
-      })();
-      const location = findByLabel(/Localiza(ç|c)ão:/i);
-      return {
-        ok: !!(statusFromImg || location),
-        status: statusFromImg || "—",
-        location: location || "—",
-      };
+        if (alt) status = alt;
+        else {
+          const src = img.getAttribute("src") || "";
+          if (/online\.png/i.test(src)) status = "Online";
+          else if (/offline\.png/i.test(src)) status = "Offline";
+        }
+      }
+
+      return { ok: !!(status || location), status: status || "—", location: location || "—" };
     });
   };
 
+  // --- fluxo principal da página ---
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await closeCookieBanner().catch(() => {});
     await ensureX50().catch(() => {});
-    await page.waitForTimeout(2000);
-    let data = await extract();
-    // se cair em tela de proteção, tenta de novo
+
+    // dá um tempo pra SPA montar e injeta retry de localização
+    await page.waitForTimeout(1200);
+
+    let data = { ok: false, status: "—", location: "—" };
+    for (let i = 0; i < 4; i++) {
+      data = await extract();
+      console.log(`extract try ${i + 1} → ok=${data.ok} status=${data.status} location=${data.location}`);
+      if (data.location && data.location !== "—") break;
+      await page.waitForTimeout(700);
+    }
+
+    // fallback anti-bot
     if (!data.ok && (await isAntiBot())) {
       await page.waitForTimeout(8000);
       await closeCookieBanner().catch(() => {});
       await ensureX50().catch(() => {});
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1200);
       data = await extract();
+      console.log(`extract (retry antibot) → ok=${data.ok} status=${data.status} location=${data.location}`);
     }
+
     await browser.close();
-    return data.ok
-      ? data
-      : { ok: false, status: "—", location: "—", error: "conteúdo não encontrado" };
+    return data.ok ? data : { ok: false, status: "—", location: "—", error: "conteúdo não encontrado" };
   } catch (e) {
     await browser.close();
-    return {
-      ok: false,
-      status: "—",
-      location: "—",
-      error: e.message || String(e),
-    };
+    return { ok: false, status: "—", location: "—", error: e.message || String(e) };
   }
 }
 
+// ---------- estado / discord ----------
 async function loadList() {
   try {
     const t = await fs.readFile(WATCHLIST_FILE, "utf8");
-    return t.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    return t.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   } catch {
     return [];
   }
 }
+
 async function loadState() {
   try {
     return JSON.parse(await fs.readFile(STATE_FILE, "utf8"));
@@ -193,18 +256,51 @@ async function loadState() {
     return {};
   }
 }
+
 async function saveState(obj) {
   await fs.writeFile(STATE_FILE, JSON.stringify(obj), "utf8");
 }
-async function postDiscord(content) {
-  await fetch(WEBHOOK, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
+
+async function persistStateGit() {
+  if (!GIT_PERSIST) return;
+  try {
+    await exec(`git config user.name "${GIT_USER_NAME}"`);
+    await exec(`git config user.email "${GIT_USER_EMAIL}"`);
+    // evita rejected: puxa antes
+    try {
+      await exec(`git pull --rebase`);
+    } catch (e) {
+      console.log("git pull --rebase falhou (segue mesmo assim):", e?.stdout || e?.message || String(e));
+    }
+    await exec(`git add ${STATE_FILE}`);
+    // commit pode não ter mudanças — não falhe se não houver nada
+    await exec(`git commit -m "chore(state): update ${new Date().toISOString()}" || true`);
+    await exec(`git push`);
+    console.log("state.json: commit + push OK");
+  } catch (e) {
+    console.error("persistStateGit error:", e?.stdout || e?.message || String(e));
+  }
 }
 
-// Loop principal: verifica cada nick e avisa se status/localização mudarem
+async function postDiscord(content) {
+  try {
+    const res = await fetch(WEBHOOK, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+    const body = await res.text().catch(() => "");
+    if (!res.ok) {
+      console.error(`Webhook FAILED: ${res.status} ${res.statusText} :: ${body.slice(0, 200)}`);
+    } else {
+      console.log(`Webhook OK: ${res.status}`);
+    }
+  } catch (e) {
+    console.error(`Webhook EXCEPTION: ${e.message || e}`);
+  }
+}
+
+// ---------- loop principal ----------
 (async () => {
   const list = await loadList();
   if (!list.length) {
@@ -212,29 +308,32 @@ async function postDiscord(content) {
     return;
   }
   const state = await loadState();
+
   for (const nick of list) {
     const cur = await renderChar(nick);
     if (!cur.ok) {
       console.log(`falha ${nick}: ${cur.error || "sem dados"}`);
       continue;
     }
+
     const prev = state[nick] || {};
     const changed = prev.status !== cur.status || prev.location !== cur.location;
-    if (changed) {
-      const msg = [
-        `**${nick}** está `,
-        prev.status !== cur.status ? `• Status: ${prev.status || "?"} → ${cur.status}` : null,
-        prev.location !== cur.location ? `• Localização: ${prev.location || "?"} → ${cur.location}` : null,
-      ]
-        .filter(Boolean)
-        .join("\n");
-      await postDiscord(msg);
-      state[nick] = {
-        status: cur.status,
-        location: cur.location,
-        updatedAt: Date.now(),
-      };
+    const firstTime = !("status" in prev) && !("location" in prev);
+    const FORCE_POST = process.env.FORCE_POST === "1";
+
+    if (changed || firstTime || FORCE_POST) {
+      const lines = [
+        `**${nick}**`,
+        `• Status: ${prev.status || "?"} → ${cur.status}`,
+        `• Localização: ${prev.location || "?"} → ${cur.location}`,
+      ];
+      await postDiscord(lines.join("\n"));
+      state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
+    } else {
+      console.log(`${nick} sem mudança (status=${cur.status}, loc=${cur.location})`);
     }
   }
+
   await saveState(state);
+  await persistStateGit(); // <- com GIT_PERSIST=1, commita e dá push
 })();
