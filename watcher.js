@@ -1,4 +1,4 @@
-// watcher v5 (seleção X‑50 robusta e status via alt/src)
+// watcher v5 (seleção X-50 via menu de seta; status via alt/src)
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -17,7 +17,6 @@ if (!WEBHOOK) {
 }
 
 async function renderChar(nick) {
-  // inicia Playwright em modo headless
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -33,19 +32,18 @@ async function renderChar(nick) {
     viewport: { width: 1366, height: 768 },
   });
   const page = await context.newPage();
-
-  // bloqueia imagens/fontes para acelerar (o <img> permanece no DOM)
-  await page.route("**/*", (route) => {
-    const type = route.request().resourceType();
-    if (type === "image" || type === "font") return route.abort();
+  // bloqueia imagens/fontes (reduz carga; ícone ainda está no DOM)
+  await page.route("**/*", route => {
+    const t = route.request().resourceType();
+    if (t === "image" || t === "font") return route.abort();
     return route.continue();
   });
 
   const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
 
-  // fecha cookie banner (botões “Permitir todos”, “Rejeitar” e iframes)
+  // fecha banner de cookies
   const closeCookieBanner = async () => {
-    const tryClick = async (sel) => {
+    const tryClick = async sel => {
       try {
         await page.locator(sel).first().click({ timeout: 700 });
         return true;
@@ -57,7 +55,6 @@ async function renderChar(nick) {
     if (await tryClick('button:has-text("Rejeitar")')) return true;
     if (await tryClick('text=Permitir todos')) return true;
     if (await tryClick('text=Rejeitar')) return true;
-    // verificação de iframes (Usercentrics/Cookiebot)
     for (const frame of page.frames()) {
       try {
         if (/usercentrics|consent|cookiebot/i.test(frame.url())) {
@@ -67,65 +64,39 @@ async function renderChar(nick) {
           await btn.click({ timeout: 800 });
           return true;
         }
-      } catch {
-        /* nada */
-      }
+      } catch {}
     }
     return false;
   };
 
-  // abre o item selecionado “CLASSIC” e clica no list-item “GUILDWAR”; confirma o selecionado
-  const ensure50x = async () => {
-    // volta para o topo do side menu
-    await page.evaluate(() => window.scrollTo(0, 0));
-
-    const selectedIsGuildwar = async () => {
-      return await page.evaluate(() => {
-        const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
-        if (!sel) return false;
-        const txt = (sel.textContent || "").replace(/\s+/g, "").toUpperCase();
-        return /GUILDWAR/.test(txt);
-      });
-    };
-
-    for (let attempt = 1; attempt <= 4; attempt++) {
+  // abre a seta do menu e escolhe GUILDWAR; confirma o selecionado
+  const ensureX50 = async () => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        // 1) localizar o item atualmente selecionado (CLASSIC)
-        const selected = page.locator('div[class*="SideMenuServers_selected"]').first();
-        await selected.scrollIntoViewIfNeeded().catch(() => {});
-        // 1a) clicar no chevron (open-btn) para expandir, ou no próprio item
-        const openBtn = selected.locator('svg[class*="open-btn"]');
-        if (await openBtn.count()) {
-          await openBtn.first().click({ force: true, timeout: 600 }).catch(() => {});
-        } else {
-          await selected.click({ force: true, timeout: 600 }).catch(() => {});
-        }
-        await page.waitForTimeout(400);
-        // 2) clicar no list-item “GUILDWAR”
-        const gwItem = page
-          .locator('div[class*="SideMenuServers_list-item"]', { hasText: "GUILDWAR" })
+        // clica na seta (open-btn) para abrir o menu
+        const arrow = page.locator('svg.SideMenuServers_open-btn__Rsa_X').first();
+        await arrow.waitFor({ timeout: 1500 });
+        await arrow.click({ force: true, timeout: 1500 });
+        // aguarda e clica em “GUILDWAR”
+        const guildOption = page
+          .locator('div.SideMenuServers_list-item__qzJXK', { hasText: "GUILDWAR" })
           .first();
-        const gwAny = page
-          .locator('div[class*="SideMenuServers_item"]', { hasText: "GUILDWAR" })
-          .first();
-        const target = (await gwItem.count()) ? gwItem : gwAny;
-        await target.scrollIntoViewIfNeeded().catch(() => {});
-        await target.click({ force: true, timeout: 1200 }).catch(() => {});
-        await page.waitForTimeout(700);
-        // 3) verifica se selecionou GUILDWAR
-        const ok = await selectedIsGuildwar();
-        const selTxt = await page.evaluate(() => {
-          const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
-          return (sel?.textContent || "").replace(/\s+/g, "");
-        });
+        await guildOption.waitFor({ timeout: 2000 });
+        await guildOption.click({ force: true, timeout: 1500 });
+        // espera a seleção atualizar
+        await page.waitForTimeout(3000);
+        // confere o texto do item selecionado
+        const selText = await page
+          .locator('div.SideMenuServers_selected__zYRfa')
+          .first()
+          .innerText();
+        const normalized = selText.replace(/\s+/g, "").toUpperCase();
         console.log(
-          `ensure50x attempt ${attempt} → selected GUILDWAR: ${ok} selectedText: ${selTxt}`,
+          `ensureX50 attempt ${attempt} → selected: ${normalized}`,
         );
-        if (ok) return;
+        if (/GUILDWAR/.test(normalized)) return;
       } catch (e) {
-        console.log(`ensure50x attempt ${attempt} error: ${e?.message || e}`);
       }
-      await page.waitForTimeout(600);
     }
   };
 
@@ -135,14 +106,14 @@ async function renderChar(nick) {
     return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(html);
   };
 
-  // extração de status/localização
+  // extrai status via alt/src e localização via rótulo
   const extract = async () => {
     return await page.evaluate(() => {
-      const findByLabel = (labelRe) => {
+      const findByLabel = re => {
         const spans = Array.from(document.querySelectorAll("span"));
         for (let i = 0; i < spans.length; i++) {
           const t = (spans[i].textContent || "").trim();
-          if (labelRe.test(t)) {
+          if (re.test(t)) {
             const next =
               spans[i].parentElement?.querySelectorAll("span")?.[1] ||
               spans[i].nextElementSibling;
@@ -154,7 +125,7 @@ async function renderChar(nick) {
         }
         return null;
       };
-      // status pelo alt ou src do ícone online/offline
+      // status pelo alt ou src
       const statusFromImg = (() => {
         const img =
           document.querySelector('img[alt="Online"], img[alt="Offline"]') ||
@@ -181,15 +152,15 @@ async function renderChar(nick) {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
     await closeCookieBanner().catch(() => {});
-    await ensure50x().catch(() => {});
-    await page.waitForTimeout(1500);
+    await ensureX50().catch(() => {});
+    await page.waitForTimeout(2000);
     let data = await extract();
-    // fallback anti-bot
+    // se cair em tela de proteção, tenta de novo
     if (!data.ok && (await isAntiBot())) {
       await page.waitForTimeout(8000);
       await closeCookieBanner().catch(() => {});
-      await ensure50x().catch(() => {});
-      await page.waitForTimeout(1200);
+      await ensureX50().catch(() => {});
+      await page.waitForTimeout(2000);
       data = await extract();
     }
     await browser.close();
@@ -210,7 +181,7 @@ async function renderChar(nick) {
 async function loadList() {
   try {
     const t = await fs.readFile(WATCHLIST_FILE, "utf8");
-    return t.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    return t.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   } catch {
     return [];
   }
@@ -233,7 +204,7 @@ async function postDiscord(content) {
   });
 }
 
-// loop principal: verifica todos os nicks, extrai status/localização e avisa no Discord em caso de mudança
+// Loop principal: verifica cada nick e avisa se status/localização mudarem
 (async () => {
   const list = await loadList();
   if (!list.length) {
@@ -253,9 +224,7 @@ async function postDiscord(content) {
       const msg = [
         `**${nick}** mudou:`,
         prev.status !== cur.status ? `• Status: ${prev.status || "?"} → ${cur.status}` : null,
-        prev.location !== cur.location
-          ? `• Localização: ${prev.location || "?"} → ${cur.location}`
-          : null,
+        prev.location !== cur.location ? `• Localização: ${prev.location || "?"} → ${cur.location}` : null,
       ]
         .filter(Boolean)
         .join("\n");
