@@ -1,4 +1,4 @@
-// watcher v10 (location pelo par de spans correto; status do cabeçalho do nick)
+// watcher v11 (mensagem só com valor atual + localização robusta por par de spans)
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -16,7 +16,7 @@ const GIT_PERSIST = process.env.GIT_PERSIST === "1";
 const GIT_USER_NAME = process.env.GIT_USER_NAME || "bot";
 const GIT_USER_EMAIL = process.env.GIT_USER_EMAIL || "bot@users.noreply.github.com";
 
-console.log("watcher version v10");
+console.log("watcher version v11");
 if (!WEBHOOK) { console.error("DISCORD_WEBHOOK_URL ausente"); process.exit(1); }
 
 async function renderChar(nick) {
@@ -32,7 +32,7 @@ async function renderChar(nick) {
   });
   const page = await context.newPage();
 
-  // acelera (mantém <img> no DOM, só não baixa bytes)
+  // acelera (mantém img no DOM)
   await page.route("**/*", r => {
     const t = r.request().resourceType();
     if (t === "image" || t === "font") return r.abort();
@@ -57,7 +57,7 @@ async function renderChar(nick) {
     }
   };
 
-  // força X-50/GUILDWAR clicando via DOM (mesmo hidden)
+  // força X-50/GUILDWAR clicando via DOM
   const ensureX50 = async () => {
     for (let attempt = 1; attempt <= 8; attempt++) {
       try {
@@ -101,7 +101,7 @@ async function renderChar(nick) {
     return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(html);
   };
 
-  // ===== leitura robusta =====
+  // leitura robusta: status no cabeçalho (img ao lado do <b>nick>), localização pelo par de spans
   const extract = async () => {
     return await page.evaluate((nickIn) => {
       const norm = (s) =>
@@ -110,7 +110,7 @@ async function renderChar(nick) {
           .replace(/\s+/g, " ").trim();
       const eqNick = (a,b) => norm(a).toLowerCase() === norm(b).toLowerCase();
 
-      // 1) STATUS no cabeçalho (linha do avatar + <b>nick</b>)
+      // === STATUS (no container do <b>nick</b>) ===
       let status = null;
       {
         const blocks = Array.from(document.querySelectorAll("div,header,section,article"));
@@ -130,28 +130,36 @@ async function renderChar(nick) {
         }
       }
 
-      // 2) LOCALIZAÇÃO pelo par de spans no MESMO div
+      // === LOCALIZAÇÃO (exatamente <div><span>Localização:</span><span>VALOR</span></div>) ===
       let location = null;
       {
+        const isLocLabel = (txt) => /^Localiza(c|ç)ao:$/i.test(
+          norm(txt).replace(/:\s*$/, ":")
+        );
         const divs = Array.from(document.querySelectorAll("div"));
         for (const d of divs) {
-          const spans = d.querySelectorAll("span");
-          if (spans.length >= 2) {
-            const label = norm(spans[0].textContent || "");
-            if (/^Localizacao:$/i.test(label)) {
-              const val = (spans[1].textContent || "").trim();
-              if (val) { location = val; break; }
+          const spans = Array.from(d.querySelectorAll(":scope > span"));
+          if (spans.length >= 2 && isLocLabel(spans[0].textContent || "")) {
+            const val = (spans[1].textContent || "").trim();
+            if (val) { location = val; break; }
+
+            // Se o segundo está vazio, varre próximos irmãos span
+            for (let i = 1; i < spans.length; i++) {
+              const vv = (spans[i].textContent || "").trim();
+              if (vv) { location = vv; break; }
             }
+            if (location) break;
           }
         }
       }
-      // fallback extra: busca “Localização:” e pega o próximo <span> irmão
+      // Fallback: acha o span "Localização:" e pega o PRÓXIMO span (irmão) não vazio
       if (!location) {
         const allSpans = Array.from(document.querySelectorAll("span"));
         for (let i = 0; i < allSpans.length - 1; i++) {
-          if (/^Localiza(c|ç)ao:$/i.test(norm(allSpans[i].textContent))) {
-            const sib = allSpans[i].nextElementSibling;
-            if (sib && sib.tagName && sib.tagName.toLowerCase() === "span") {
+          if (/^Localiza(c|ç)ao:$/i.test(norm(allSpans[i].textContent || ""))) {
+            let sib = allSpans[i].nextElementSibling;
+            while (sib && sib.tagName && sib.tagName.toLowerCase() !== "span") sib = sib.nextElementSibling;
+            if (sib && sib.tagName?.toLowerCase() === "span") {
               const v = (sib.textContent || "").trim();
               if (v) { location = v; break; }
             }
@@ -227,26 +235,16 @@ async function postDiscord(content) {
     const cur = await renderChar(nick);
     if (!cur.ok) { console.log(`falha ${nick}: ${cur.error || "sem dados"}`); continue; }
 
-    const prev = state[nick] || {};
-    const changed = prev.status !== cur.status || prev.location !== cur.location;
-    const firstTime = !("status" in prev) && !("location" in prev);
-    const FORCE_POST = process.env.FORCE_POST === "1";
+    // Sempre enviar APENAS o valor atual (sem "→")
+    const msg = [
+      `**${nick}**`,
+      `• Status: ${cur.status}`,
+      `• Localização: ${cur.location}`,
+    ].join("\n");
+    await postDiscord(msg);
 
-    // mensagem: mostra seta só quando mudou; senão mostra valor atual
-    const statusLine = changed && prev.status !== cur.status
-      ? `• Status: ${prev.status || "?"} → ${cur.status}`
-      : `• Status: ${cur.status}`;
-    const locLine = changed && prev.location !== cur.location
-      ? `• Localização: ${prev.location || "?"} → ${cur.location}`
-      : `• Localização: ${cur.location}`;
-
-    if (changed || firstTime || FORCE_POST) {
-      const msg = [`**${nick}**`, statusLine, locLine].join("\n");
-      await postDiscord(msg);
-      state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
-    } else {
-      console.log(`${nick} sem mudança (status=${cur.status}, loc=${cur.location})`);
-    }
+    // Atualiza o state (mesmo sem mudança — útil p/ dashboard/consulta)
+    state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
   }
 
   await saveState(state);
