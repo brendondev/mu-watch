@@ -1,4 +1,4 @@
-// watcher v21 — parallel queue + fast location + single-batch Discord + stable X-50
+// watcher v22 — balanced waits, progressive retries, batch Discord, stable X-50
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -8,9 +8,9 @@ const PATH = process.env.MU_CHAR_PATH || "/pt/char/";
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
-const CONCURRENCY = Number(process.env.CONCURRENCY || 3); // <— ajuste se quiser
+const CONCURRENCY = Number(process.env.CONCURRENCY || 3); // ajuste se necessário
 
-console.log("watcher version v21");
+console.log("watcher version v22");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL is missing");
@@ -56,7 +56,7 @@ function chunkText(s, lim = 1900) {
 /* ---------------- Page helpers ---------------- */
 async function closeCookieBanner(page) {
   const tryClick = async (sel) => {
-    try { await page.locator(sel).first().click({ timeout: 600 }); return true; } catch { return false; }
+    try { await page.locator(sel).first().click({ timeout: 700 }); return true; } catch { return false; }
   };
   if (await tryClick('button:has-text("Permitir todos")')) return;
   if (await tryClick('button:has-text("Rejeitar")')) return;
@@ -82,15 +82,15 @@ async function ensureX50Once(page, maxTries = 3) {
       });
       if (selectedTxt && /GUILDWAR/.test(selectedTxt)) return;
 
-      // open selected group (usually X-5 CLASSIC)
+      // abre grupo selecionado
       await page.evaluate(() => {
         const all = Array.from(document.querySelectorAll('div[class*="SideMenuServers_item"]'));
         const sel = all.find(el => el.className.includes("SideMenuServers_selected")) || all[0];
         if (sel) sel.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
-      await page.waitForTimeout(180);
+      await page.waitForTimeout(220);
 
-      // click GUILDWAR (X-50)
+      // clica GUILDWAR (X-50)
       await page.evaluate(() => {
         const items = Array.from(document.querySelectorAll('div[class*="SideMenuServers_item"]'));
         const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toUpperCase();
@@ -106,15 +106,14 @@ async function ensureX50Once(page, maxTries = 3) {
         const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
         const txt = (sel?.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
         return /GUILDWAR/.test(txt);
-      }, { timeout: 1200 }).catch(() => false);
+      }, { timeout: 1600 }).catch(() => false);
 
       if (ok) return;
     } catch {}
-    await page.waitForTimeout(180);
+    await page.waitForTimeout(200);
   }
 }
 
-// quick check if currently X-5
 async function isX5(page) {
   return await page.evaluate(() => {
     const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
@@ -123,12 +122,11 @@ async function isX5(page) {
   }).catch(() => false);
 }
 
-// Fast wait (<= 4500ms) for header + non-empty location
-async function waitForHeaderAndLocation(page, nick, timeoutMs = 4500) {
+// espera header + localização não vazia (até 6.5s)
+async function waitForHeaderAndLocation(page, nick, timeoutMs = 6500) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const ok = await page.evaluate((n) => {
-      // header with <b>{nick}</b>
       const nameBlocks = Array.from(
         document.querySelectorAll(
           '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'
@@ -141,7 +139,6 @@ async function waitForHeaderAndLocation(page, nick, timeoutMs = 4500) {
       });
       if (!header) return false;
 
-      // scoped char-info first, then global fallback
       const pick = (root) => {
         const spans = Array.from(root.querySelectorAll('span'));
         for (let i = 0; i < spans.length; i++) {
@@ -164,14 +161,13 @@ async function waitForHeaderAndLocation(page, nick, timeoutMs = 4500) {
     }, nick).catch(() => false);
 
     if (ok) return;
-    await page.waitForTimeout(120);
+    await page.waitForTimeout(140);
   }
 }
 
-// single extraction (status anchored on header, location from char-info w/ fallback)
 async function extractOnce(page, nick) {
   return await page.evaluate((n) => {
-    // STATUS — icon near <b>{nick}</b>
+    // STATUS — junto ao <b>{nick}</b>
     let status = '—';
     const nameBlocks = Array.from(
       document.querySelectorAll(
@@ -189,7 +185,7 @@ async function extractOnce(page, nick) {
       if (img) status = img.getAttribute('alt') || '—';
     }
 
-    // LOCATION — first char-info, then global
+    // LOCATION — primeiro no char-info, depois global fallback
     const pickLocation = (root) => {
       const spans = Array.from(root.querySelectorAll('span'));
       for (let i = 0; i < spans.length; i++) {
@@ -218,31 +214,36 @@ async function extractOnce(page, nick) {
   }, nick);
 }
 
-// full per-nick routine with tight timing (≈ 3.5–5s hard cap)
+// rotina por nick (com reload opcional)
 async function processNick(page, nick) {
   const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
   await page.goto(url, { waitUntil: "domcontentloaded" });
 
-  // fix to X-50 only if needed (fast)
   if (await isX5(page)) {
     await ensureX50Once(page).catch(() => {});
     await page.goto(url, { waitUntil: "domcontentloaded" });
   }
 
-  // quick wait for header+location (≤ 4.5s)
-  await waitForHeaderAndLocation(page, nick, 4500);
-  await page.waitForTimeout(120);
+  await waitForHeaderAndLocation(page, nick, 6500);
+  await page.waitForTimeout(150);
 
-  // try up to 3 times if location blank
-  let data = await extractOnce(page, nick);
-  if (data.location === '—') {
-    await page.waitForTimeout(300);
+  // tenta extrair com 4 re-tentativas progressivas
+  const delays = [0, 250, 400, 600, 800];
+  let data = { ok: false, status: '—', location: '—' };
+  for (const d of delays) {
+    if (d) await page.waitForTimeout(d);
     data = await extractOnce(page, nick);
-    if (data.location === '—') {
-      await page.waitForTimeout(500);
-      data = await extractOnce(page, nick);
-    }
+    if (data.ok && data.location !== '—') break;
   }
+
+  // se ainda ruim, 1 reload rápido e última tentativa
+  if (!data.ok || data.location === '—') {
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await waitForHeaderAndLocation(page, nick, 2500);
+    await page.waitForTimeout(200);
+    data = await extractOnce(page, nick);
+  }
+
   return data.ok ? data : { ok: false, status: '—', location: '—', error: 'no-data' };
 }
 
@@ -255,7 +256,6 @@ async function processNick(page, nick) {
   }
   const state = await loadState();
 
-  // one browser, multiple pages in pool
   const browser = await chromium.launch({
     headless: true,
     args: [
@@ -278,20 +278,16 @@ async function processNick(page, nick) {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 
-  // allow same-origin JS/CSS; block images/fonts/media + known heavy third-parties
+  // bloquear image/font/media e trackers; manter JS/CSS do host
   const host = new URL(BASE).host;
   await context.route("**/*", (route) => {
     const req = route.request();
     const type = req.resourceType();
     const url = req.url();
     if (["image", "font", "media"].includes(type)) return route.abort();
-
-    // kill heavy third-party trackers
     if (/(googletagmanager|google-analytics|gtag|facebook|hotjar|yandex|tiktok)/i.test(url)) {
       return route.abort();
     }
-
-    // prefer same-origin for scripts/styles (suficiente pro Next.js do site)
     try {
       const u = new URL(url);
       if ((type === "script" || type === "stylesheet") && u.host !== host) {
@@ -301,21 +297,21 @@ async function processNick(page, nick) {
     return route.continue();
   });
 
-  // warmup: open home once, accept cookies, set X-50 in one tab (não precisa repetir)
+  // aquecimento: cookies + X-50
   const warm = await context.newPage();
-  warm.setDefaultTimeout(2500);
-  warm.setDefaultNavigationTimeout(8000);
+  warm.setDefaultTimeout(3000);
+  warm.setDefaultNavigationTimeout(9000);
   await warm.goto(`${BASE}/pt/`, { waitUntil: "domcontentloaded" });
   await closeCookieBanner(warm).catch(() => {});
   await ensureX50Once(warm).catch(() => {});
   await warm.close();
 
-  // create page pool
+  // pool de páginas
   const pages = [];
   for (let i = 0; i < CONCURRENCY; i++) {
     const p = await context.newPage();
-    p.setDefaultTimeout(2500);
-    p.setDefaultNavigationTimeout(8000);
+    p.setDefaultTimeout(3200);
+    p.setDefaultNavigationTimeout(9000);
     pages.push(p);
   }
 
@@ -326,7 +322,6 @@ async function processNick(page, nick) {
     while (idx < list.length) {
       const myIdx = idx++;
       const nick = list[myIdx];
-
       try {
         const cur = await processNick(p, nick);
         if (!cur.ok) {
@@ -344,21 +339,18 @@ async function processNick(page, nick) {
       } catch (e) {
         console.log(`fail ${nick}: ${e?.message || e}`);
       }
-
-      // tiny jitter to avoid heuristics
-      await p.waitForTimeout(60 + Math.random() * 90);
+      await p.waitForTimeout(80 + Math.random() * 120);
     }
   }
 
   await Promise.all(pages.map((p) => worker(p)));
 
-  // batch post (single or few messages max)
   if (changes.length) {
     const blocks = changes.map(c => `**${c.nick}**\n• Status: ${c.status}\n• Location: ${c.location}`);
     const payload = blocks.join("\n\n");
     for (const part of chunkText(payload, 1800)) {
       await postDiscord(part);
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 250));
     }
   } else {
     console.log("no changes to report");
