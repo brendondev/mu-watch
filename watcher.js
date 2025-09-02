@@ -1,4 +1,4 @@
-// watcher v16 — stable X-50 switch + anchored extraction (status & location)
+// watcher v17 — single browser/page, one-time X-50 select, fast extraction, single webhook
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -9,261 +9,14 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 
-console.log("watcher version v16");
+console.log("watcher version v17");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL is missing");
   process.exit(1);
 }
 
-/* -------------------------- core render -------------------------- */
-async function renderChar(nick) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"],
-  });
-
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    locale: "pt-BR",
-    extraHTTPHeaders: {
-      "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-      "upgrade-insecure-requests": "1",
-    },
-    viewport: { width: 1366, height: 768 },
-  });
-
-  const page = await context.newPage();
-
-  // speed up: block images/fonts (DOM still has <img alt/src>)
-  await page.route("**/*", (route) => {
-    const t = route.request().resourceType();
-    if (t === "image" || t === "font") return route.abort();
-    return route.continue();
-  });
-
-  const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
-
-  /* -------------------------- helpers -------------------------- */
-  const closeCookieBanner = async () => {
-    const tryClick = async (sel) => {
-      try {
-        await page.locator(sel).first().click({ timeout: 800 });
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    if (await tryClick('button:has-text("Permitir todos")')) return true;
-    if (await tryClick('button:has-text("Rejeitar")')) return true;
-    if (await tryClick('text=Permitir todos')) return true;
-    if (await tryClick('text=Rejeitar')) return true;
-
-    // iframe-based banners (Usercentrics/Cookiebot)
-    for (const f of page.frames()) {
-      try {
-        if (/usercentrics|consent|cookiebot/i.test(f.url())) {
-          const btn = f
-            .locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")')
-            .first();
-          await btn.click({ timeout: 800 });
-          return true;
-        }
-      } catch {}
-    }
-    return false;
-  };
-
-  // Robust X-50: open the selected group then click item that contains "GUILDWAR"
-  async function ensureX50(maxTries = 4) {
-    for (let i = 1; i <= maxTries; i++) {
-      try {
-        await page.evaluate(() => window.scrollTo(0, 0));
-
-        // open the currently selected server group (usually X - 5 CLASSIC)
-        await page.evaluate(() => {
-          const all = Array.from(
-            document.querySelectorAll('div[class*="SideMenuServers_item"]')
-          );
-          const sel =
-            all.find((el) => el.className.includes("SideMenuServers_selected")) ||
-            all[0];
-          if (sel) {
-            sel.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-          }
-        });
-
-        await page.waitForTimeout(500);
-
-        // click the GUILDWAR option
-        await page.evaluate(() => {
-          const items = Array.from(
-            document.querySelectorAll('div[class*="SideMenuServers_item"]')
-          );
-          function norm(s) {
-            return (s || "").replace(/\s+/g, " ").trim().toUpperCase();
-          }
-          const target =
-            items.find((el) => /GUILDWAR/.test(norm(el.textContent))) ||
-            items.find((el) => /X\s*-\s*50/.test(norm(el.textContent)));
-          if (target) {
-            target.scrollIntoView({ block: "center" });
-            target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-          }
-        });
-
-        // confirm selection turned into GUILDWAR
-        const ok = await page.waitForFunction(() => {
-          const sel = document.querySelector(
-            'div[class*="SideMenuServers_selected"]'
-          );
-          const txt = (sel?.textContent || "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .toUpperCase();
-          return /GUILDWAR/.test(txt);
-        }, { timeout: 2000 }).catch(() => false);
-
-        if (ok) {
-          console.log(`ensureX50 attempt ${i}: OK (GUILDWAR selected)`);
-          return;
-        } else {
-          const selTxt = await page.evaluate(() => {
-            const sel = document.querySelector(
-              'div[class*="SideMenuServers_selected"]'
-            );
-            return (sel?.textContent || "").replace(/\s+/g, " ").trim();
-          });
-          console.log(
-            `ensureX50 attempt ${i}: still not GUILDWAR → selectedText: ${selTxt}`
-          );
-        }
-      } catch (e) {
-        console.log(`ensureX50 attempt ${i} error: ${e?.message || e}`);
-      }
-      await page.waitForTimeout(600);
-    }
-  }
-
-  // Wait until the "Localização:" label exists and the value span is non-empty
-  async function waitForLocationReady(timeoutMs = 6000) {
-    await page
-      .waitForFunction(() => {
-        const spans = Array.from(document.querySelectorAll("span"));
-        for (const s of spans) {
-          const t = (s.textContent || "").trim();
-          if (/^Localiza(?:ç|c)ão:$/.test(t)) {
-            const next = s.nextElementSibling;
-            const val =
-              next && next.tagName?.toLowerCase() === "span"
-                ? (next.textContent || "").trim()
-                : "";
-            return val.length > 0;
-          }
-        }
-        return false;
-      }, { timeout: timeoutMs })
-      .catch(() => {});
-  }
-
-  const isAntiBot = async () => {
-    const html = await page.content();
-    return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(
-      html
-    );
-  };
-
-  // Extract ONLY from the character header and the exact Localização pair
-  const extract = async () => {
-    return await page.evaluate(() => {
-      // 1) Status — the icon beside the nickname in the header
-      let status = null;
-      const nameRow = document.querySelector(
-        '.CharPage_name__wtExV, [class*="CharPage_name__"]'
-      );
-      if (nameRow) {
-        const statusImg = nameRow.querySelector(
-          'img[alt="Online"], img[alt="Offline"]'
-        );
-        if (statusImg) status = statusImg.getAttribute("alt") || null;
-      }
-      if (!status) {
-        const fallback = document.querySelector(
-          'img[alt="Online"], img[alt="Offline"]'
-        );
-        if (fallback) status = fallback.getAttribute("alt");
-      }
-
-      // 2) Location — exact label "Localização:" then its sibling <span>
-      let location = null;
-      const spans = Array.from(document.querySelectorAll("span"));
-      for (const s of spans) {
-        const t = (s.textContent || "").trim();
-        if (/^Localiza(?:ç|c)ão:$/.test(t)) {
-          const next = s.nextElementSibling;
-          if (next && next.tagName?.toLowerCase() === "span") {
-            location = (next.textContent || "").trim();
-            break;
-          }
-        }
-      }
-
-      // Normalize: Lorencia → Privada
-      if (location && /lorencia/i.test(location)) location = "Privada";
-
-      return {
-        ok: !!(status || location),
-        status: status || "—",
-        location: location || "—",
-      };
-    });
-  };
-
-  /* -------------------------- flow -------------------------- */
-  try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-
-    await closeCookieBanner().catch(() => {});
-    await ensureX50().catch(() => {});
-
-    // Give the SPA time to render the header + location after switching
-    await waitForLocationReady(6000);
-    await page.waitForTimeout(400);
-
-    let data = await extract();
-
-    // Retry if Cloudflare page or still empty
-    if (!data.ok && (await isAntiBot())) {
-      await page.waitForTimeout(8000);
-      await closeCookieBanner().catch(() => {});
-      await ensureX50().catch(() => {});
-      await waitForLocationReady(6000);
-      await page.waitForTimeout(400);
-      data = await extract();
-    }
-
-    await browser.close();
-    return data.ok
-      ? data
-      : {
-          ok: false,
-          status: "—",
-          location: "—",
-          error: "content-not-found",
-        };
-  } catch (e) {
-    await browser.close();
-    return {
-      ok: false,
-      status: "—",
-      location: "—",
-      error: e.message || String(e),
-    };
-  }
-}
-
-/* ---------------------- list / state / notify ---------------------- */
+/* ---------------------- utils: io ---------------------- */
 async function loadList() {
   try {
     const t = await fs.readFile(WATCHLIST_FILE, "utf8");
@@ -272,7 +25,6 @@ async function loadList() {
     return [];
   }
 }
-
 async function loadState() {
   try {
     return JSON.parse(await fs.readFile(STATE_FILE, "utf8"));
@@ -280,16 +32,141 @@ async function loadState() {
     return {};
   }
 }
-
 async function saveState(obj) {
   await fs.writeFile(STATE_FILE, JSON.stringify(obj), "utf8");
 }
-
 async function postDiscord(content) {
   await fetch(WEBHOOK, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ content }),
+  });
+}
+
+/* ----------------- page helpers (fast) ----------------- */
+async function closeCookieBanner(page) {
+  const tryClick = async (sel) => {
+    try { await page.locator(sel).first().click({ timeout: 500 }); return true; } catch { return false; }
+  };
+  if (await tryClick('button:has-text("Permitir todos")')) return;
+  if (await tryClick('button:has-text("Rejeitar")')) return;
+  if (await tryClick('text=Permitir todos')) return;
+  if (await tryClick('text=Rejeitar')) return;
+
+  for (const f of page.frames()) {
+    try {
+      if (/usercentrics|consent|cookiebot/i.test(f.url())) {
+        const btn = f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first();
+        await btn.click({ timeout: 600 });
+        return;
+      }
+    } catch {}
+  }
+}
+
+async function ensureX50Once(page, maxTries = 3) {
+  for (let i = 1; i <= maxTries; i++) {
+    try {
+      const selectedTxt = await page.evaluate(() => {
+        const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+        return (sel?.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
+      });
+      if (selectedTxt && /GUILDWAR/.test(selectedTxt)) {
+        console.log(`ensureX50: already GUILDWAR`);
+        return;
+      }
+
+      // abre grupo selecionado (geralmente X-5 CLASSIC)
+      await page.evaluate(() => {
+        const all = Array.from(document.querySelectorAll('div[class*="SideMenuServers_item"]'));
+        const sel = all.find(el => el.className.includes("SideMenuServers_selected")) || all[0];
+        if (sel) sel.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await page.waitForTimeout(250);
+
+      // clica na opção GUILDWAR (X-50)
+      await page.evaluate(() => {
+        const items = Array.from(document.querySelectorAll('div[class*="SideMenuServers_item"]'));
+        const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toUpperCase();
+        const target = items.find(el => /GUILDWAR/.test(norm(el.textContent))) ||
+                       items.find(el => /X\s*-\s*50/.test(norm(el.textContent)));
+        if (target) {
+          target.scrollIntoView({ block: "center" });
+          target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        }
+      });
+
+      const ok = await page.waitForFunction(() => {
+        const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+        const txt = (sel?.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
+        return /GUILDWAR/.test(txt);
+      }, { timeout: 1200 }).catch(() => false);
+
+      if (ok) {
+        console.log(`ensureX50 attempt ${i}: OK (GUILDWAR selected)`);
+        return;
+      } else {
+        const selTxt = await page.evaluate(() => {
+          const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+          return (sel?.textContent || "").replace(/\s+/g, " ").trim();
+        });
+        console.log(`ensureX50 attempt ${i}: still not GUILDWAR → selectedText: ${selTxt}`);
+      }
+    } catch (e) {
+      console.log(`ensureX50 attempt ${i} error: ${e?.message || e}`);
+    }
+    await page.waitForTimeout(250);
+  }
+}
+
+async function waitForLocationReady(page, timeoutMs = 2500) {
+  await page.waitForFunction(() => {
+    const info = document.querySelector('.CharPage_char-info__EW_Lb') || document;
+    const spans = Array.from(info.querySelectorAll("span"));
+    for (const s of spans) {
+      const t = (s.textContent || "").trim();
+      if (/^Localiza(?:ç|c)ão:$/i.test(t)) {
+        const next = s.parentElement?.querySelectorAll('span')?.[1] || s.nextElementSibling;
+        const val = next && next.tagName?.toLowerCase() === 'span' ? (next.textContent || '').trim() : '';
+        return val.length > 0;
+      }
+    }
+    return false;
+  }, { timeout: timeoutMs }).catch(() => {});
+}
+
+async function extractFast(page) {
+  return await page.evaluate(() => {
+    // Status — ícone ao lado do nick no header do char
+    let status = null;
+    const nameBlock = document.querySelector('.CharPage_name__wtExV, [class*="CharPage_name__"]');
+    if (nameBlock) {
+      const img = nameBlock.querySelector('img[alt="Online"], img[alt="Offline"]');
+      if (img) status = img.getAttribute('alt') || null;
+    }
+    if (!status) {
+      const fb = document.querySelector('img[alt="Online"], img[alt="Offline"]');
+      if (fb) status = fb.getAttribute('alt') || null;
+    }
+
+    // Localização — par "Localização:" + próximo <span>
+    let location = '—';
+    const info = document.querySelector('.CharPage_char-info__EW_Lb') || document;
+    const spans = Array.from(info.querySelectorAll('span'));
+    for (let i = 0; i < spans.length; i++) {
+      const t = (spans[i].textContent || '').trim();
+      if (/^Localiza(?:ç|c)ão:$/i.test(t)) {
+        const next = spans[i].parentElement?.querySelectorAll('span')?.[1] || spans[i].nextElementSibling;
+        if (next && next.tagName?.toLowerCase() === 'span') {
+          location = (next.textContent || '').trim() || '—';
+        }
+        break;
+      }
+    }
+
+    if (/^Lorencia$/i.test(location)) location = 'Privada';
+
+    return { ok: !!(status || (location && location !== '—')), status: status || '—', location };
   });
 }
 
@@ -302,30 +179,104 @@ async function postDiscord(content) {
   }
   const state = await loadState();
 
+  // 1 navegador / 1 contexto / 1 aba
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-blink-features=AutomationControlled",
+    ],
+  });
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    locale: "pt-BR",
+    extraHTTPHeaders: {
+      "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+      "upgrade-insecure-requests": "1",
+    },
+    viewport: { width: 1280, height: 800 },
+  });
+  await context.addInitScript(() => {
+    // menos chance de bloqueio
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
+
+  // Bloqueio agressivo de recursos/hosts (permite doc/script/xhr do mesmo host)
+  await context.route("**/*", (route) => {
+    const req = route.request();
+    const url = req.url();
+    const type = req.resourceType();
+    const sameHost = url.startsWith("https://mudream.online");
+
+    if (!sameHost) return route.abort();
+    if (["image", "font", "stylesheet", "media", "websocket", "eventsource", "manifest"].includes(type))
+      return route.abort();
+    return route.continue();
+  });
+
+  const page = await context.newPage();
+  page.setDefaultTimeout(2500);
+  page.setDefaultNavigationTimeout(7000);
+
+  // Vai na home 1x, aceita cookies 1x, seleciona X-50 1x
+  await page.goto(`${BASE}/pt/`, { waitUntil: "domcontentloaded" });
+  await closeCookieBanner(page).catch(() => {});
+  await ensureX50Once(page).catch(() => {});
+
+  const changes = [];
   for (const nick of list) {
-    const cur = await renderChar(nick);
+    const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+
+    // se por algum motivo voltou pro X-5, corrige rapidamente
+    const stillX5 = await page.evaluate(() => {
+      const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
+      const txt = (sel?.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
+      return !/GUILDWAR/.test(txt);
+    }).catch(() => false);
+    if (stillX5) {
+      await ensureX50Once(page).catch(() => {});
+      await page.goto(url, { waitUntil: "domcontentloaded" });
+    }
+
+    await waitForLocationReady(page, 2000);
+    const cur = await extractFast(page);
+
     if (!cur.ok) {
-      console.log(`fail ${nick}: ${cur.error || "no data"}`);
-      continue;
+      console.log(`skip ${nick}: no data`);
+    } else {
+      const prev = state[nick] || {};
+      const changed = prev.status !== cur.status || prev.location !== cur.location;
+      if (changed) {
+        changes.push({ nick, ...cur, prev });
+        state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
+      } else {
+        console.log(`no change ${nick}: status=${cur.status} loc=${cur.location}`);
+      }
     }
 
-    const prev = state[nick] || {};
-    const changed = prev.status !== cur.status || prev.location !== cur.location;
-
-    if (changed) {
-      const lines = [
-        `**${nick}**`,
-        `• Status: ${cur.status}`,
-        `• Location: ${cur.location}`,
-      ];
-      await postDiscord(lines.join("\n"));
-      state[nick] = {
-        status: cur.status,
-        location: cur.location,
-        updatedAt: Date.now(),
-      };
-    }
+    // jitter pequeno entre páginas
+    await page.waitForTimeout(120 + Math.random() * 120);
   }
 
+  // Uma única mensagem pro Discord
+  if (changes.length) {
+    const lines = [];
+    for (const c of changes) {
+      lines.push(`**${c.nick}**`);
+      lines.push(`• Status: ${c.status}`);
+      lines.push(`• Location: ${c.location}`);
+      lines.push("");
+    }
+    await postDiscord(lines.join("\n").trim());
+  } else {
+    console.log("no changes to report");
+  }
+
+  // Salva state SEMPRE
   await saveState(state);
+
+  await browser.close();
 })();
