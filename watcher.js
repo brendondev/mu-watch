@@ -1,7 +1,6 @@
-// watcher v17 — fixa seleção X-50 via DOM (sem waitForSelector) + header-anchored status/location + state
+// watcher v16 — stable X-50 switch + anchored extraction (status & location)
 import { chromium } from "playwright";
 import fs from "fs/promises";
-import path from "path";
 import fetch from "node-fetch";
 
 const BASE = process.env.MU_BASE_URL || "https://mudream.online";
@@ -10,37 +9,14 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 
-console.log("watcher version v17");
-if (!WEBHOOK) { console.error("DISCORD_WEBHOOK_URL ausente"); process.exit(1); }
+console.log("watcher version v16");
 
-/* ------------------ FS & Discord ------------------ */
-async function ensureDirOf(filePath) {
-  const dir = path.dirname(path.resolve(filePath));
-  await fs.mkdir(dir, { recursive: true }).catch(() => {});
-}
-async function loadList() {
-  try {
-    const raw = await fs.readFile(WATCHLIST_FILE, "utf8");
-    return raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
-  } catch { return []; }
-}
-async function loadState() {
-  try { return JSON.parse(await fs.readFile(STATE_FILE, "utf8")); }
-  catch { return {}; }
-}
-async function saveState(obj) {
-  await ensureDirOf(STATE_FILE);
-  await fs.writeFile(STATE_FILE, JSON.stringify(obj, null, 2), "utf8");
-}
-async function postDiscord(content) {
-  await fetch(WEBHOOK, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
+if (!WEBHOOK) {
+  console.error("DISCORD_WEBHOOK_URL is missing");
+  process.exit(1);
 }
 
-/* ------------------ Scraper core ------------------ */
+/* -------------------------- core render -------------------------- */
 async function renderChar(nick) {
   const browser = await chromium.launch({
     headless: true,
@@ -60,212 +36,296 @@ async function renderChar(nick) {
 
   const page = await context.newPage();
 
-  // Acelera: não carregar fontes/imagens (o <img> com alt/src ainda fica no DOM)
+  // speed up: block images/fonts (DOM still has <img alt/src>)
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
-    if (t === "font" || t === "image") return route.abort();
-    route.continue();
+    if (t === "image" || t === "font") return route.abort();
+    return route.continue();
   });
 
   const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
 
+  /* -------------------------- helpers -------------------------- */
   const closeCookieBanner = async () => {
     const tryClick = async (sel) => {
-      try { await page.locator(sel).first().click({ timeout: 500 }); return true; } catch { return false; }
+      try {
+        await page.locator(sel).first().click({ timeout: 800 });
+        return true;
+      } catch {
+        return false;
+      }
     };
-    if (await tryClick('button:has-text("Permitir todos")')) return;
-    if (await tryClick('button:has-text("Rejeitar")')) return;
-    if (await tryClick('text=Permitir todos')) return;
-    if (await tryClick('text=Rejeitar')) return;
+    if (await tryClick('button:has-text("Permitir todos")')) return true;
+    if (await tryClick('button:has-text("Rejeitar")')) return true;
+    if (await tryClick('text=Permitir todos')) return true;
+    if (await tryClick('text=Rejeitar')) return true;
+
+    // iframe-based banners (Usercentrics/Cookiebot)
     for (const f of page.frames()) {
       try {
         if (/usercentrics|consent|cookiebot/i.test(f.url())) {
-          await f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first().click({ timeout: 700 });
-          return;
+          const btn = f
+            .locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")')
+            .first();
+          await btn.click({ timeout: 800 });
+          return true;
         }
       } catch {}
-    }
-  };
-
-  // Seleciona X-50 (“GUILDWAR”) usando somente DOM/dispatchEvent, com tentativas
-  const ensureX50 = async () => {
-    for (let attempt = 1; attempt <= 6; attempt++) {
-      const ok = await page.evaluate(() => {
-        const norm = (s) => (s || "").replace(/\s+/g, "").toUpperCase();
-        const normSp = (s) => (s || "").toUpperCase();
-
-        // 1) pega o item selecionado atual (normalmente CLASSIC / X-5)
-        const selected = document.querySelector('div[class*="SideMenuServers_selected"]') ||
-                         document.querySelector('div[class*="SideMenuServers_item"]');
-
-        // função segura de clique
-        const safeClick = (el) => {
-          try {
-            el.scrollIntoView({ block: "center", inline: "center" });
-            el.style.removeProperty("display");
-            el.style.visibility = "visible";
-            el.style.opacity = "1";
-            const evt = new MouseEvent("click", { bubbles: true, cancelable: true, view: window });
-            el.dispatchEvent(evt);
-            return true;
-          } catch { return false; }
-        };
-
-        // já está em GUILDWAR?
-        const selectedTxt = norm(selected?.textContent || "");
-        if (/GUILDWAR|X-50/.test(selectedTxt)) return true;
-
-        // 2) tenta abrir o grupo (chevron)
-        if (selected) {
-          const chevron = selected.querySelector('svg[class*="open-btn"]');
-          if (chevron) safeClick(chevron);
-          safeClick(selected);
-        }
-
-        // 3) procura o item "GUILDWAR" ou “X - 50”
-        const items = Array.from(document.querySelectorAll('div[class*="SideMenuServers_item"], div[class*="SideMenuServers_list-item"]'));
-        const target = items.find(el => /GUILDWAR/.test(norm(el.textContent || "")) || /X-50/.test(norm(el.textContent || "")) || /X\s*-\s*50/.test(normSp(el.textContent || "")));
-        if (target) {
-          safeClick(target);
-        }
-
-        // 4) checa novamente o selecionado
-        const selNow = document.querySelector('div[class*="SideMenuServers_selected"]') || selected;
-        const txt = norm(selNow?.textContent || "");
-        return /GUILDWAR|X-50/.test(txt);
-      });
-
-      const selText = await page.evaluate(() => {
-        const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
-        return (sel?.textContent || "").replace(/\s+/g, "");
-      });
-      console.log(`ensureX50 attempt ${attempt} → selected: ${selText}`);
-
-      if (ok) return true;
-      await page.waitForTimeout(500 + attempt * 150);
     }
     return false;
   };
 
-  const extractHeader = async (nickLower) => {
-    return await page.evaluate((nickLower_) => {
-      const norm = (s) => (s || "").trim().toLowerCase();
+  // Robust X-50: open the selected group then click item that contains "GUILDWAR"
+  async function ensureX50(maxTries = 4) {
+    for (let i = 1; i <= maxTries; i++) {
+      try {
+        await page.evaluate(() => window.scrollTo(0, 0));
 
-      // 1) <b>nick</b>
-      const bNick = Array.from(document.querySelectorAll("b"))
-        .find(b => norm(b.textContent) === nickLower_);
-      if (!bNick) return { ok: false, status: null, location: null, reason: "nick-not-found" };
-
-      // 2) header
-      const header = bNick.closest('[class*="CharPage_char-header"]') ||
-                     bNick.closest('[class*="CharPage_name-block"]') ||
-                     bNick.parentElement;
-
-      if (!header) return { ok: false, status: null, location: null, reason: "header-not-found" };
-
-      // 3) status (ícone ao lado do nick)
-      let status = null;
-      const sImg = header.querySelector('img[alt="Online"], img[alt="Offline"]') ||
-                   header.querySelector('img[src*="/assets/images/online"], img[src*="/assets/images/offline"]');
-      if (sImg) {
-        const alt = sImg.getAttribute("alt");
-        if (alt) status = alt;
-        else {
-          const src = sImg.getAttribute("src") || "";
-          if (/online\.png/i.test(src)) status = "Online";
-          if (/offline\.png/i.test(src)) status = "Offline";
-        }
-      }
-
-      // 4) location (par de spans dentro do bloco info do header)
-      let location = null;
-      const info = header.querySelector('[class*="CharPage_char-info"]') || header;
-      const spans = Array.from(info.querySelectorAll("span"));
-      for (let i = 0; i < spans.length; i++) {
-        const t = (spans[i].textContent || "").trim();
-        if (/^Localiza(?:ç|c)ão:$/i.test(t) || /^Location:$/i.test(t)) {
-          const sib = spans[i].nextElementSibling;
-          if (sib && sib.tagName?.toLowerCase() === "span") {
-            location = (sib.textContent || "").trim();
-            break;
+        // open the currently selected server group (usually X - 5 CLASSIC)
+        await page.evaluate(() => {
+          const all = Array.from(
+            document.querySelectorAll('div[class*="SideMenuServers_item"]')
+          );
+          const sel =
+            all.find((el) => el.className.includes("SideMenuServers_selected")) ||
+            all[0];
+          if (sel) {
+            sel.dispatchEvent(new MouseEvent("click", { bubbles: true }));
           }
-          const inParent = spans[i].parentElement?.querySelectorAll("span");
-          if (inParent && inParent.length >= 2) {
-            location = (inParent[1].textContent || "").trim();
-            break;
+        });
+
+        await page.waitForTimeout(500);
+
+        // click the GUILDWAR option
+        await page.evaluate(() => {
+          const items = Array.from(
+            document.querySelectorAll('div[class*="SideMenuServers_item"]')
+          );
+          function norm(s) {
+            return (s || "").replace(/\s+/g, " ").trim().toUpperCase();
+          }
+          const target =
+            items.find((el) => /GUILDWAR/.test(norm(el.textContent))) ||
+            items.find((el) => /X\s*-\s*50/.test(norm(el.textContent)));
+          if (target) {
+            target.scrollIntoView({ block: "center" });
+            target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+          }
+        });
+
+        // confirm selection turned into GUILDWAR
+        const ok = await page.waitForFunction(() => {
+          const sel = document.querySelector(
+            'div[class*="SideMenuServers_selected"]'
+          );
+          const txt = (sel?.textContent || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toUpperCase();
+          return /GUILDWAR/.test(txt);
+        }, { timeout: 2000 }).catch(() => false);
+
+        if (ok) {
+          console.log(`ensureX50 attempt ${i}: OK (GUILDWAR selected)`);
+          return;
+        } else {
+          const selTxt = await page.evaluate(() => {
+            const sel = document.querySelector(
+              'div[class*="SideMenuServers_selected"]'
+            );
+            return (sel?.textContent || "").replace(/\s+/g, " ").trim();
+          });
+          console.log(
+            `ensureX50 attempt ${i}: still not GUILDWAR → selectedText: ${selTxt}`
+          );
+        }
+      } catch (e) {
+        console.log(`ensureX50 attempt ${i} error: ${e?.message || e}`);
+      }
+      await page.waitForTimeout(600);
+    }
+  }
+
+  // Wait until the "Localização:" label exists and the value span is non-empty
+  async function waitForLocationReady(timeoutMs = 6000) {
+    await page
+      .waitForFunction(() => {
+        const spans = Array.from(document.querySelectorAll("span"));
+        for (const s of spans) {
+          const t = (s.textContent || "").trim();
+          if (/^Localiza(?:ç|c)ão:$/.test(t)) {
+            const next = s.nextElementSibling;
+            const val =
+              next && next.tagName?.toLowerCase() === "span"
+                ? (next.textContent || "").trim()
+                : "";
+            return val.length > 0;
           }
         }
-      }
+        return false;
+      }, { timeout: timeoutMs })
+      .catch(() => {});
+  }
 
-      if (location && /^\s*lorencia/i.test(location)) location = "Privada";
-
-      return { ok: !!(status || location), status: status || "—", location: location || "—" };
-    }, nickLower);
+  const isAntiBot = async () => {
+    const html = await page.content();
+    return /Just a moment|Checking your browser|cf-chl|Attention Required/i.test(
+      html
+    );
   };
 
+  // Extract ONLY from the character header and the exact Localização pair
+  const extract = async () => {
+    return await page.evaluate(() => {
+      // 1) Status — the icon beside the nickname in the header
+      let status = null;
+      const nameRow = document.querySelector(
+        '.CharPage_name__wtExV, [class*="CharPage_name__"]'
+      );
+      if (nameRow) {
+        const statusImg = nameRow.querySelector(
+          'img[alt="Online"], img[alt="Offline"]'
+        );
+        if (statusImg) status = statusImg.getAttribute("alt") || null;
+      }
+      if (!status) {
+        const fallback = document.querySelector(
+          'img[alt="Online"], img[alt="Offline"]'
+        );
+        if (fallback) status = fallback.getAttribute("alt");
+      }
+
+      // 2) Location — exact label "Localização:" then its sibling <span>
+      let location = null;
+      const spans = Array.from(document.querySelectorAll("span"));
+      for (const s of spans) {
+        const t = (s.textContent || "").trim();
+        if (/^Localiza(?:ç|c)ão:$/.test(t)) {
+          const next = s.nextElementSibling;
+          if (next && next.tagName?.toLowerCase() === "span") {
+            location = (next.textContent || "").trim();
+            break;
+          }
+        }
+      }
+
+      // Normalize: Lorencia → Privada
+      if (location && /lorencia/i.test(location)) location = "Privada";
+
+      return {
+        ok: !!(status || location),
+        status: status || "—",
+        location: location || "—",
+      };
+    });
+  };
+
+  /* -------------------------- flow -------------------------- */
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await closeCookieBanner().catch(()=>{});
 
-    // tenta forçar X-50 pelo DOM, sem travar a execução se falhar
-    await page.waitForTimeout(700);
-    const switched = await ensureX50().catch(()=>false);
-    console.log(`X-50 switched: ${!!switched}`);
+    await closeCookieBanner().catch(() => {});
+    await ensureX50().catch(() => {});
 
-    // tempo para header hidratar
-    await page.waitForTimeout(1200);
+    // Give the SPA time to render the header + location after switching
+    await waitForLocationReady(6000);
+    await page.waitForTimeout(400);
 
-    // captura a partir do header do nick
-    let data = await extractHeader(nick.trim().toLowerCase());
-    if (!data.ok) {
-      await page.waitForTimeout(1000);
-      data = await extractHeader(nick.trim().toLowerCase());
+    let data = await extract();
+
+    // Retry if Cloudflare page or still empty
+    if (!data.ok && (await isAntiBot())) {
+      await page.waitForTimeout(8000);
+      await closeCookieBanner().catch(() => {});
+      await ensureX50().catch(() => {});
+      await waitForLocationReady(6000);
+      await page.waitForTimeout(400);
+      data = await extract();
     }
 
     await browser.close();
-    return data.ok ? data : { ok: false, status: "—", location: "—", error: "content-not-found" };
+    return data.ok
+      ? data
+      : {
+        ok: false,
+        status: "—",
+        location: "—",
+        error: "content-not-found",
+      };
   } catch (e) {
     await browser.close();
-    return { ok: false, status: "—", location: "—", error: e.message || String(e) };
+    return {
+      ok: false,
+      status: "—",
+      location: "—",
+      error: e.message || String(e),
+    };
   }
 }
 
-/* ------------------ Main loop ------------------ */
+/* ---------------------- list / state / notify ---------------------- */
+async function loadList() {
+  try {
+    const t = await fs.readFile(WATCHLIST_FILE, "utf8");
+    return t.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function loadState() {
+  try {
+    return JSON.parse(await fs.readFile(STATE_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+async function saveState(obj) {
+  await fs.writeFile(STATE_FILE, JSON.stringify(obj), "utf8");
+}
+
+async function postDiscord(content) {
+  await fetch(WEBHOOK, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+}
+
+/* ------------------------------ main ------------------------------ */
 (async () => {
   const list = await loadList();
-  if (!list.length) { console.log("watchlist vazia"); return; }
+  if (!list.length) {
+    console.log("watchlist is empty");
+    return;
+  }
+  const state = await loadState();
 
-  let state = await loadState();
-  if (!state || typeof state !== "object") state = {};
-  await saveState(state); // garante existência
-
-  let changedAnything = false;
-
-  for (const raw of list) {
-    const nick = raw.trim();
-    if (!nick) continue;
-
+  for (const nick of list) {
     const cur = await renderChar(nick);
-    if (!cur.ok) { console.log(`falha ${nick}: ${cur.error || "sem dados"}`); continue; }
+    if (!cur.ok) {
+      console.log(`fail ${nick}: ${cur.error || "no data"}`);
+      continue;
+    }
 
     const prev = state[nick] || {};
     const changed = prev.status !== cur.status || prev.location !== cur.location;
 
-    // salva snapshot atual SEMPRE
-    state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
-    changedAnything ||= changed;
-
     if (changed) {
-      const msg = [`**${nick}**`, `• Status: ${cur.status}`, `• Location: ${cur.location}`].join("\n");
-      await postDiscord(msg);
-      console.log(`notificado ${nick}: ${cur.status} / ${cur.location}`);
-    } else {
-      console.log(`sem mudança ${nick}: ${cur.status} / ${cur.location}`);
+      const lines = [
+        `**${nick}**`,
+        `• Status: ${cur.status}`,
+        `• Location: ${cur.location}`,
+      ];
+      await postDiscord(lines.join("\n"));
+      state[nick] = {
+        status: cur.status,
+        location: cur.location,
+        updatedAt: Date.now(),
+      };
     }
   }
 
-  if (changedAnything) {
-    await saveState(state);
-    console.log("state.json atualizado");
-  }
+  await saveState(state);
 })();
