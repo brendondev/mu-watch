@@ -2,7 +2,7 @@ name: mu-watch
 
 on:
   schedule:
-    - cron: "*/45 * * * *"   # a cada 45 min
+    - cron: "*/5 * * * *"   # a cada 45 min
   workflow_dispatch:
     inputs:
       nicks:
