@@ -1,4 +1,4 @@
-// watcher v19 — X-50 once, anchored status, reliable location from char-info, faster waits
+// watcher v20 — batch único no Discord + localização robusta + X-50 estável + CSS liberado
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -9,14 +9,14 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 
-console.log("watcher version v19");
+console.log("watcher version v20");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL is missing");
   process.exit(1);
 }
 
-/* ---------------------- utils: io ---------------------- */
+/* ---------------- IO ---------------- */
 async function loadList() {
   try {
     const t = await fs.readFile(WATCHLIST_FILE, "utf8");
@@ -35,29 +35,37 @@ async function loadState() {
 async function saveState(obj) {
   await fs.writeFile(STATE_FILE, JSON.stringify(obj), "utf8");
 }
-async function postDiscord(content) {
+async function postDiscord(text) {
   await fetch(WEBHOOK, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content: text }),
   });
 }
+function chunkText(s, lim = 1900) {
+  const chunks = [];
+  let i = 0;
+  while (i < s.length) {
+    chunks.push(s.slice(i, i + lim));
+    i += lim;
+  }
+  return chunks;
+}
 
-/* ----------------- page helpers (fast) ----------------- */
+/* --------------- Page helpers --------------- */
 async function closeCookieBanner(page) {
   const tryClick = async (sel) => {
-    try { await page.locator(sel).first().click({ timeout: 600 }); return true; } catch { return false; }
+    try { await page.locator(sel).first().click({ timeout: 700 }); return true; } catch { return false; }
   };
   if (await tryClick('button:has-text("Permitir todos")')) return;
   if (await tryClick('button:has-text("Rejeitar")')) return;
   if (await tryClick('text=Permitir todos')) return;
   if (await tryClick('text=Rejeitar')) return;
-
   for (const f of page.frames()) {
     try {
       if (/usercentrics|consent|cookiebot/i.test(f.url())) {
         const btn = f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first();
-        await btn.click({ timeout: 600 });
+        await btn.click({ timeout: 800 });
         return;
       }
     } catch {}
@@ -76,7 +84,7 @@ async function ensureX50Once(page, maxTries = 3) {
         return;
       }
 
-      // abre grupo selecionado (geralmente X-5 CLASSIC)
+      // abre o grupo selecionado (frequente X-5 CLASSIC)
       await page.evaluate(() => {
         const all = Array.from(document.querySelectorAll('div[class*="SideMenuServers_item"]'));
         const sel = all.find(el => el.className.includes("SideMenuServers_selected")) || all[0];
@@ -84,7 +92,7 @@ async function ensureX50Once(page, maxTries = 3) {
       });
       await page.waitForTimeout(220);
 
-      // clica na opção GUILDWAR (X-50)
+      // clica GUILDWAR (X-50)
       await page.evaluate(() => {
         const items = Array.from(document.querySelectorAll('div[class*="SideMenuServers_item"]'));
         const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toUpperCase();
@@ -100,7 +108,7 @@ async function ensureX50Once(page, maxTries = 3) {
         const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
         const txt = (sel?.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
         return /GUILDWAR/.test(txt);
-      }, { timeout: 1400 }).catch(() => false);
+      }, { timeout: 1600 }).catch(() => false);
 
       if (ok) {
         console.log(`ensureX50 attempt ${i}: OK (GUILDWAR selected)`);
@@ -119,8 +127,8 @@ async function ensureX50Once(page, maxTries = 3) {
   }
 }
 
-// aguarda header com <b>nick</b> e Localização preenchida (com tolerância)
-async function waitForHeaderAndLocation(page, nick, timeoutMs = 6000) {
+// espera header com <b>nick</b> e a Localização com valor não-vazio
+async function waitForHeaderAndLocation(page, nick, timeoutMs = 9000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const ok = await page.evaluate((n) => {
@@ -137,22 +145,33 @@ async function waitForHeaderAndLocation(page, nick, timeoutMs = 6000) {
       });
       if (!header) return false;
 
-      // bloco certo da info do personagem
+      // bloco com informações (escopo primário)
       const infoRoot =
         document.querySelector('.CharPage_char-info__EW_Lb') ||
         document.querySelector('[class*="CharPage_char-info__"]') ||
         document;
 
-      // Localização com tolerância de espaços e 2º <span> não vazio
       const spans = Array.from(infoRoot.querySelectorAll('span'));
       for (let i = 0; i < spans.length; i++) {
         const t = (spans[i].textContent || '').replace(/\s+/g, ' ').trim();
         if (/^Localiza(?:ç|c)ão\s*:?\s*$/i.test(t)) {
           const next = spans[i].parentElement?.querySelectorAll('span')?.[1] || spans[i].nextElementSibling;
           const val = next && next.tagName?.toLowerCase() === 'span' ? (next.textContent || '').trim() : '';
-          return val.length > 0;
+          if (val.length > 0) return true;
         }
       }
+
+      // fallback global (algumas páginas atrasam o escopo principal)
+      const all = Array.from(document.querySelectorAll('span'));
+      for (let i = 0; i < all.length; i++) {
+        const t = (all[i].textContent || '').replace(/\s+/g, ' ').trim();
+        if (/^Localiza(?:ç|c)ão\s*:?\s*$/i.test(t)) {
+          const next = all[i].parentElement?.querySelectorAll('span')?.[1] || all[i].nextElementSibling;
+          const val = next && next.tagName?.toLowerCase() === 'span' ? (next.textContent || '').trim() : '';
+          if (val.length > 0) return true;
+        }
+      }
+
       return false;
     }, nick).catch(() => false);
 
@@ -163,7 +182,7 @@ async function waitForHeaderAndLocation(page, nick, timeoutMs = 6000) {
 
 async function extractFast(page, nick) {
   return await page.evaluate((n) => {
-    // STATUS: ícone apenas no header que contém o <b>{nick}</b>
+    // STATUS — ícone no header do <b>{nick}</b>
     let status = '—';
     const nameBlocks = Array.from(
       document.querySelectorAll(
@@ -181,24 +200,29 @@ async function extractFast(page, nick) {
       if (img) status = img.getAttribute('alt') || '—';
     }
 
-    // LOCALIZAÇÃO: dentro do bloco CharPage_char-info__..., pega o 2º <span>
+    // LOCALIZAÇÃO — procurar no escopo char-info; fallback global
+    const pickLocation = (root) => {
+      const spans = Array.from(root.querySelectorAll('span'));
+      for (let i = 0; i < spans.length; i++) {
+        const t = (spans[i].textContent || '').replace(/\s+/g, ' ').trim();
+        if (/^Localiza(?:ç|c)ão\s*:?\s*$/i.test(t)) {
+          const next = spans[i].parentElement?.querySelectorAll('span')?.[1] || spans[i].nextElementSibling;
+          if (next && next.tagName?.toLowerCase() === 'span') {
+            const v = (next.textContent || '').trim();
+            if (v) return v;
+          }
+        }
+      }
+      return null;
+    };
+
     let location = '—';
     const infoRoot =
       document.querySelector('.CharPage_char-info__EW_Lb') ||
       document.querySelector('[class*="CharPage_char-info__"]') ||
-      document;
+      null;
 
-    const spans = Array.from(infoRoot.querySelectorAll('span'));
-    for (let i = 0; i < spans.length; i++) {
-      const t = (spans[i].textContent || '').replace(/\s+/g, ' ').trim();
-      if (/^Localiza(?:ç|c)ão\s*:?\s*$/i.test(t)) {
-        const next = spans[i].parentElement?.querySelectorAll('span')?.[1] || spans[i].nextElementSibling;
-        if (next && next.tagName?.toLowerCase() === 'span') {
-          location = (next.textContent || '').trim() || '—';
-        }
-        break;
-      }
-    }
+    location = (infoRoot && pickLocation(infoRoot)) || pickLocation(document) || '—';
 
     if (/^Lorencia$/i.test(location)) location = 'Privada';
 
@@ -206,7 +230,7 @@ async function extractFast(page, nick) {
   }, nick);
 }
 
-/* ------------------------------ main ------------------------------ */
+/* ------------------------------ MAIN ------------------------------ */
 (async () => {
   const list = await loadList();
   if (!list.length) {
@@ -238,15 +262,15 @@ async function extractFast(page, nick) {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 
-  // Bloqueio: corta image/font/media/stylesheet; libera script/xhr/fetch/document (qualquer host)
+  // Bloqueio leve: NÃO corta stylesheet (evita render travado); corta só image/font/media
   await context.route("**/*", (route) => {
     const type = route.request().resourceType();
-    if (["image", "font", "media", "stylesheet"].includes(type)) return route.abort();
+    if (["image", "font", "media"].includes(type)) return route.abort();
     return route.continue();
   });
 
   const page = await context.newPage();
-  page.setDefaultTimeout(3000);
+  page.setDefaultTimeout(3200);
   page.setDefaultNavigationTimeout(9000);
 
   // Home 1x: cookies + X-50 1x
@@ -259,7 +283,7 @@ async function extractFast(page, nick) {
     const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // se por algum motivo caiu no X-5, corrige rápido
+    // se caiu em X-5, corrige rápido e volta
     const stillX5 = await page.evaluate(() => {
       const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
       const txt = (sel?.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
@@ -270,8 +294,21 @@ async function extractFast(page, nick) {
       await page.goto(url, { waitUntil: "domcontentloaded" });
     }
 
-    await waitForHeaderAndLocation(page, nick, 6000);
-    const cur = await extractFast(page, nick);
+    // espera header + localização com valor
+    await waitForHeaderAndLocation(page, nick, 9000);
+    // pequena margem p/ SPA pintar
+    await page.waitForTimeout(200);
+
+    // tenta extrair, com 2 pequenas re-tentativas se location sair em branco
+    let cur = await extractFast(page, nick);
+    if (cur.location === '—') {
+      await page.waitForTimeout(500);
+      cur = await extractFast(page, nick);
+      if (cur.location === '—') {
+        await page.waitForTimeout(700);
+        cur = await extractFast(page, nick);
+      }
+    }
 
     if (!cur.ok) {
       console.log(`skip ${nick}: no data`);
@@ -286,18 +323,18 @@ async function extractFast(page, nick) {
       }
     }
 
-    await page.waitForTimeout(100 + Math.random() * 120);
+    // jitter mínimo entre perfis (evita CF heurística)
+    await page.waitForTimeout(90 + Math.random() * 90);
   }
 
+  // Posta em lote (1 ou mais mensagens se exceder 2k chars)
   if (changes.length) {
-    const lines = [];
-    for (const c of changes) {
-      lines.push(`**${c.nick}**`);
-      lines.push(`• Status: ${c.status}`);
-      lines.push(`• Location: ${c.location}`);
-      lines.push("");
+    const blocks = changes.map(c => `**${c.nick}**\n• Status: ${c.status}\n• Location: ${c.location}`);
+    const payload = blocks.join("\n\n");
+    for (const part of chunkText(payload, 1800)) {
+      await postDiscord(part);
+      await new Promise(r => setTimeout(r, 250)); // respiro entre mensagens
     }
-    await postDiscord(lines.join("\n").trim());
   } else {
     console.log("no changes to report");
   }
