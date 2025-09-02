@@ -2,8 +2,17 @@ name: mu-watch
 
 on:
   schedule:
-    - cron: "*/45 * * * *"   # a cada 5 min
-  workflow_dispatch: {}     # executar manualmente
+    - cron: "*/45 * * * *"   # a cada 45 min
+  workflow_dispatch:
+    inputs:
+      nicks:
+        description: 'Lista de nicks separados por vírgula (opcional)'
+        required: false
+        default: ''
+
+concurrency:
+  group: mu-watch
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -12,6 +21,8 @@ jobs:
       contents: write   # para commitar .state.json
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0           # necessário para dar push
 
       - name: Verify source version
         run: |
@@ -31,6 +42,13 @@ jobs:
         run: |
           npm install
           npx playwright install --with-deps chromium
+
+      - name: Prepare watchlist (override via dispatch)
+        if: ${{ github.event.inputs.nicks != '' }}
+        run: |
+          echo "${{ github.event.inputs.nicks }}" | tr ',' '\n' | sed 's/^ *//; s/ *$//' > watchlist.txt
+          echo "Watchlist override:"
+          cat watchlist.txt
 
       - name: Run watcher
         timeout-minutes: 5
