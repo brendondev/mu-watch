@@ -247,11 +247,11 @@ async function renderChar(nick) {
     return data.ok
       ? data
       : {
-        ok: false,
-        status: "—",
-        location: "—",
-        error: "content-not-found",
-      };
+          ok: false,
+          status: "—",
+          location: "—",
+          error: "content-not-found",
+        };
   } catch (e) {
     await browser.close();
     return {
