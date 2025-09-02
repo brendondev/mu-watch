@@ -8,7 +8,7 @@ const PATH = process.env.MU_CHAR_PATH || "/pt/char/";
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
-const CONCURRENCY = Number(process.env.CONCURRENCY || 3); // ajuste se necessário
+const CONCURRENCY = Number(process.env.CONCURRENCY || 4); // ajuste se necessário
 
 console.log("watcher version v22");
 
