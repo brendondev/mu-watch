@@ -2,7 +2,7 @@ name: mu-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # a cada 45 min
+    - cron: "*/5 * * * *"   # a cada 5 min
   workflow_dispatch:
     inputs:
       nicks:
@@ -10,8 +10,9 @@ on:
         required: false
         default: ''
 
+# Garante execução única por workflow+branch e cancela a anterior imediatamente
 concurrency:
-  group: mu-watch
+  group: ${{ github.workflow }}-${{ github.ref }}-singleton
   cancel-in-progress: true
 
 jobs:
