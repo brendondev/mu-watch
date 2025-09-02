@@ -1,4 +1,4 @@
-// watcher v17 — single browser/page, one-time X-50 select, fast extraction, single webhook
+// watcher v18 — fast single-page, robust X-50, status anchored to nick, xhr allowed
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -9,7 +9,7 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 
-console.log("watcher version v17");
+console.log("watcher version v18");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL is missing");
@@ -46,7 +46,7 @@ async function postDiscord(content) {
 /* ----------------- page helpers (fast) ----------------- */
 async function closeCookieBanner(page) {
   const tryClick = async (sel) => {
-    try { await page.locator(sel).first().click({ timeout: 500 }); return true; } catch { return false; }
+    try { await page.locator(sel).first().click({ timeout: 600 }); return true; } catch { return false; }
   };
   if (await tryClick('button:has-text("Permitir todos")')) return;
   if (await tryClick('button:has-text("Rejeitar")')) return;
@@ -82,7 +82,7 @@ async function ensureX50Once(page, maxTries = 3) {
         const sel = all.find(el => el.className.includes("SideMenuServers_selected")) || all[0];
         if (sel) sel.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
-      await page.waitForTimeout(250);
+      await page.waitForTimeout(220);
 
       // clica na opção GUILDWAR (X-50)
       await page.evaluate(() => {
@@ -115,44 +115,62 @@ async function ensureX50Once(page, maxTries = 3) {
     } catch (e) {
       console.log(`ensureX50 attempt ${i} error: ${e?.message || e}`);
     }
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(220);
   }
 }
 
-async function waitForLocationReady(page, timeoutMs = 2500) {
-  await page.waitForFunction(() => {
-    const info = document.querySelector('.CharPage_char-info__EW_Lb') || document;
-    const spans = Array.from(info.querySelectorAll("span"));
-    for (const s of spans) {
-      const t = (s.textContent || "").trim();
-      if (/^Localiza(?:ç|c)ão:$/i.test(t)) {
-        const next = s.parentElement?.querySelectorAll('span')?.[1] || s.nextElementSibling;
-        const val = next && next.tagName?.toLowerCase() === 'span' ? (next.textContent || '').trim() : '';
-        return val.length > 0;
+async function waitForHeaderAndLocation(page, nick, timeoutMs = 4000) {
+  // espera o header com o <b>nick</b> e a label Localização com valor
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const ok = await page.evaluate((n) => {
+      // header com o nick
+      const containers = Array.from(document.querySelectorAll('.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'));
+      const hasNick = containers.some(c => new RegExp(`\\b${n}\\b`, 'i').test(c.textContent || ''));
+      if (!hasNick) return false;
+
+      // localização preenchida
+      const spans = Array.from(document.querySelectorAll('span'));
+      for (const s of spans) {
+        const t = (s.textContent || '').trim();
+        if (/^Localiza(?:ç|c)ão:$/.test(t)) {
+          const next = s.parentElement?.querySelectorAll('span')?.[1] || s.nextElementSibling;
+          const val = next && next.tagName?.toLowerCase() === 'span' ? (next.textContent || '').trim() : '';
+          return val.length > 0;
+        }
       }
-    }
-    return false;
-  }, { timeout: timeoutMs }).catch(() => {});
+      return false;
+    }, nick).catch(() => false);
+
+    if (ok) return;
+    await page.waitForTimeout(150);
+  }
 }
 
-async function extractFast(page) {
-  return await page.evaluate(() => {
-    // Status — ícone ao lado do nick no header do char
+async function extractFast(page, nick) {
+  return await page.evaluate((n) => {
+    // STATUS — somente na linha que contém o <b>{nick}</b>
     let status = null;
-    const nameBlock = document.querySelector('.CharPage_name__wtExV, [class*="CharPage_name__"]');
-    if (nameBlock) {
-      const img = nameBlock.querySelector('img[alt="Online"], img[alt="Offline"]');
+    const nameBlocks = Array.from(document.querySelectorAll('.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'));
+    const header = nameBlocks.find(c => {
+      const b = c.querySelector('b');
+      const txt = (b?.textContent || c.textContent || '').trim();
+      return new RegExp(`\\b${n}\\b`, 'i').test(txt);
+    }) || null;
+
+    if (header) {
+      const img = header.querySelector('img[alt="Online"], img[alt="Offline"]');
       if (img) status = img.getAttribute('alt') || null;
     }
+
     if (!status) {
-      const fb = document.querySelector('img[alt="Online"], img[alt="Offline"]');
-      if (fb) status = fb.getAttribute('alt') || null;
+      // fallback: nenhum status
+      status = '—';
     }
 
-    // Localização — par "Localização:" + próximo <span>
+    // LOCALIZAÇÃO — par label/valor
     let location = '—';
-    const info = document.querySelector('.CharPage_char-info__EW_Lb') || document;
-    const spans = Array.from(info.querySelectorAll('span'));
+    const spans = Array.from(document.querySelectorAll('span'));
     for (let i = 0; i < spans.length; i++) {
       const t = (spans[i].textContent || '').trim();
       if (/^Localiza(?:ç|c)ão:$/i.test(t)) {
@@ -166,8 +184,8 @@ async function extractFast(page) {
 
     if (/^Lorencia$/i.test(location)) location = 'Privada';
 
-    return { ok: !!(status || (location && location !== '—')), status: status || '—', location };
-  });
+    return { ok: (status !== '—' || (location && location !== '—')), status, location };
+  }, nick);
 }
 
 /* ------------------------------ main ------------------------------ */
@@ -199,28 +217,21 @@ async function extractFast(page) {
     viewport: { width: 1280, height: 800 },
   });
   await context.addInitScript(() => {
-    // menos chance de bloqueio
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 
-  // Bloqueio agressivo de recursos/hosts (permite doc/script/xhr do mesmo host)
+  // Bloqueio: só corta image/font/media/stylesheet; deixa script/xhr/fetch/document liberados (qualquer host)
   await context.route("**/*", (route) => {
-    const req = route.request();
-    const url = req.url();
-    const type = req.resourceType();
-    const sameHost = url.startsWith("https://mudream.online");
-
-    if (!sameHost) return route.abort();
-    if (["image", "font", "stylesheet", "media", "websocket", "eventsource", "manifest"].includes(type))
-      return route.abort();
+    const type = route.request().resourceType();
+    if (["image", "font", "media", "stylesheet"].includes(type)) return route.abort();
     return route.continue();
   });
 
   const page = await context.newPage();
   page.setDefaultTimeout(2500);
-  page.setDefaultNavigationTimeout(7000);
+  page.setDefaultNavigationTimeout(8000);
 
-  // Vai na home 1x, aceita cookies 1x, seleciona X-50 1x
+  // Home 1x: cookies + X-50 1x
   await page.goto(`${BASE}/pt/`, { waitUntil: "domcontentloaded" });
   await closeCookieBanner(page).catch(() => {});
   await ensureX50Once(page).catch(() => {});
@@ -230,7 +241,7 @@ async function extractFast(page) {
     const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // se por algum motivo voltou pro X-5, corrige rapidamente
+    // se por algum motivo voltou pro X-5, corrige rápido
     const stillX5 = await page.evaluate(() => {
       const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
       const txt = (sel?.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
@@ -241,8 +252,8 @@ async function extractFast(page) {
       await page.goto(url, { waitUntil: "domcontentloaded" });
     }
 
-    await waitForLocationReady(page, 2000);
-    const cur = await extractFast(page);
+    await waitForHeaderAndLocation(page, nick, 3500);
+    const cur = await extractFast(page, nick);
 
     if (!cur.ok) {
       console.log(`skip ${nick}: no data`);
@@ -250,18 +261,16 @@ async function extractFast(page) {
       const prev = state[nick] || {};
       const changed = prev.status !== cur.status || prev.location !== cur.location;
       if (changed) {
-        changes.push({ nick, ...cur, prev });
+        changes.push({ nick, ...cur });
         state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
       } else {
         console.log(`no change ${nick}: status=${cur.status} loc=${cur.location}`);
       }
     }
 
-    // jitter pequeno entre páginas
-    await page.waitForTimeout(120 + Math.random() * 120);
+    await page.waitForTimeout(110 + Math.random() * 120);
   }
 
-  // Uma única mensagem pro Discord
   if (changes.length) {
     const lines = [];
     for (const c of changes) {
@@ -275,8 +284,6 @@ async function extractFast(page) {
     console.log("no changes to report");
   }
 
-  // Salva state SEMPRE
   await saveState(state);
-
   await browser.close();
 })();
