@@ -2,7 +2,7 @@ name: mu-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # a cada 5 min
+    - cron: "*/45 * * * *"   # a cada 5 min
   workflow_dispatch: {}     # executar manualmente
 
 jobs:
