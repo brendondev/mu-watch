@@ -1,4 +1,4 @@
-// watcher v22 — balanced waits, progressive retries, batch Discord, stable X-50
+// watcher v1 — balanced waits, progressive retries, batch Discord, stable X-50
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -10,7 +10,7 @@ const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 1); // ajuste se necessário
 
-console.log("watcher version v22");
+console.log("watcher version v1");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL is missing");
@@ -380,7 +380,7 @@ async function processNick(page, nick) {
         color,
         description: `${statusLine}\n${locLine}\n\n⏱️ <t:${unix}:f> • <t:${unix}:R>`,
         footer: {
-          text: `watcher v22 • GuildWar (X-50) • CONCURRENCY=${CONCURRENCY}`
+          text: `watcher v1 • GuildWar (X-50) • CONCURRENCY=${CONCURRENCY}`
         },
         timestamp: new Date(c.updatedAt || Date.now()).toISOString(),
       };
