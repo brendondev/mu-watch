@@ -36,11 +36,15 @@ async function loadState() {
 async function saveState(obj) {
   await fs.writeFile(STATE_FILE, JSON.stringify(obj), "utf8");
 }
-async function postDiscord(text) {
+async function postDiscord(payload) {
+  const body = (typeof payload === "string")
+    ? { content: payload }
+    : payload;
+
   await fetch(WEBHOOK, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ content: text }),
+    body: JSON.stringify(body),
   });
 }
 function chunkText(s, lim = 1900) {
@@ -330,8 +334,15 @@ async function processNick(page, nick) {
           const prev = state[nick] || {};
           const changed = prev.status !== cur.status || prev.location !== cur.location;
           if (changed) {
-            changes.push({ nick, ...cur });
-            state[nick] = { status: cur.status, location: cur.location, updatedAt: Date.now() };
+            const now = Date.now();
+            changes.push({
+              nick,
+              ...cur,
+              prevStatus: (prev.status ?? '—'),
+              prevLocation: (prev.location ?? '—'),
+              updatedAt: now
+            });
+            state[nick] = { status: cur.status, location: cur.location, updatedAt: now };
           } else {
             console.log(`no change ${nick}: status=${cur.status} loc=${cur.location}`);
           }
@@ -346,11 +357,46 @@ async function processNick(page, nick) {
   await Promise.all(pages.map((p) => worker(p)));
 
   if (changes.length) {
-    const blocks = changes.map(c => `**${c.nick}**\n• Status: ${c.status}\n• Location: ${c.location}`);
-    const payload = blocks.join("\n\n");
-    for (const part of chunkText(payload, 1800)) {
-      await postDiscord(part);
-      await new Promise(r => setTimeout(r, 250));
+    // resumo
+    const statusChanges = changes.filter(c => c.prevStatus !== c.status).length;
+    const locChangesOnly = changes.length - statusChanges;
+
+    // monta embeds (1 por nick), com cores e before→after
+    const embeds = changes.map((c) => {
+      const statusChanged = c.prevStatus !== c.status;
+      const color = statusChanged
+        ? (c.status === 'Online' ? 0x2ecc71 : 0xe74c3c) // verde / vermelho
+        : 0x3498db; // azul para mudança só de localização
+
+      const unix = Math.floor((c.updatedAt || Date.now()) / 1000);
+      const url = `${BASE}${PATH}${encodeURIComponent(c.nick)}`;
+      const statusLine = `**Status:** \`${c.prevStatus || '—'}\` → \`${c.status}\``;
+      const locLine    = `**Localização:** \`${c.prevLocation || '—'}\` → \`${c.location}\``;
+      const titleEmoji = statusChanged ? (c.status === 'Online' ? '🟢' : '🔴') : '📍';
+
+      return {
+        title: `${titleEmoji} ${c.nick}`,
+        url,
+        color,
+        description: `${statusLine}\n${locLine}\n\n⏱️ <t:${unix}:f> • <t:${unix}:R>`,
+        footer: {
+          text: `watcher v22 • GuildWar (X-50) • CONCURRENCY=${CONCURRENCY}`
+        },
+        timestamp: new Date(c.updatedAt || Date.now()).toISOString(),
+      };
+    });
+
+    // manda em lotes de até 10 embeds por mensagem (limite do Discord)
+    const header = `**Atualizações (${changes.length})** — ${statusChanges} de status, ${locChangesOnly} de localização`;
+    for (let i = 0; i < embeds.length; i += 10) {
+      const slice = embeds.slice(i, i + 10);
+      await postDiscord({
+        username: "MU Watcher X-50",
+        // opcional: avatar_url: "https://i.imgur.com/xxxxxxxx.png",
+        content: i === 0 ? header : undefined,
+        embeds: slice,
+      });
+      await new Promise(r => setTimeout(r, 300));
     }
   } else {
     console.log("no changes to report");
