@@ -1,4 +1,4 @@
-// watcher v18 — fast single-page, robust X-50, status anchored to nick, xhr allowed
+// watcher v19 — X-50 once, anchored status, reliable location from char-info, faster waits
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -9,7 +9,7 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 
-console.log("watcher version v18");
+console.log("watcher version v19");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL is missing");
@@ -100,7 +100,7 @@ async function ensureX50Once(page, maxTries = 3) {
         const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
         const txt = (sel?.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
         return /GUILDWAR/.test(txt);
-      }, { timeout: 1200 }).catch(() => false);
+      }, { timeout: 1400 }).catch(() => false);
 
       if (ok) {
         console.log(`ensureX50 attempt ${i}: OK (GUILDWAR selected)`);
@@ -119,22 +119,36 @@ async function ensureX50Once(page, maxTries = 3) {
   }
 }
 
-async function waitForHeaderAndLocation(page, nick, timeoutMs = 4000) {
-  // espera o header com o <b>nick</b> e a label Localização com valor
+// aguarda header com <b>nick</b> e Localização preenchida (com tolerância)
+async function waitForHeaderAndLocation(page, nick, timeoutMs = 6000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const ok = await page.evaluate((n) => {
       // header com o nick
-      const containers = Array.from(document.querySelectorAll('.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'));
-      const hasNick = containers.some(c => new RegExp(`\\b${n}\\b`, 'i').test(c.textContent || ''));
-      if (!hasNick) return false;
+      const nameBlocks = Array.from(
+        document.querySelectorAll(
+          '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'
+        )
+      );
+      const header = nameBlocks.find(c => {
+        const b = c.querySelector('b');
+        const txt = (b?.textContent || c.textContent || '').trim();
+        return new RegExp(`\\b${n}\\b`, 'i').test(txt);
+      });
+      if (!header) return false;
 
-      // localização preenchida
-      const spans = Array.from(document.querySelectorAll('span'));
-      for (const s of spans) {
-        const t = (s.textContent || '').trim();
-        if (/^Localiza(?:ç|c)ão:$/.test(t)) {
-          const next = s.parentElement?.querySelectorAll('span')?.[1] || s.nextElementSibling;
+      // bloco certo da info do personagem
+      const infoRoot =
+        document.querySelector('.CharPage_char-info__EW_Lb') ||
+        document.querySelector('[class*="CharPage_char-info__"]') ||
+        document;
+
+      // Localização com tolerância de espaços e 2º <span> não vazio
+      const spans = Array.from(infoRoot.querySelectorAll('span'));
+      for (let i = 0; i < spans.length; i++) {
+        const t = (spans[i].textContent || '').replace(/\s+/g, ' ').trim();
+        if (/^Localiza(?:ç|c)ão\s*:?\s*$/i.test(t)) {
+          const next = spans[i].parentElement?.querySelectorAll('span')?.[1] || spans[i].nextElementSibling;
           const val = next && next.tagName?.toLowerCase() === 'span' ? (next.textContent || '').trim() : '';
           return val.length > 0;
         }
@@ -149,9 +163,13 @@ async function waitForHeaderAndLocation(page, nick, timeoutMs = 4000) {
 
 async function extractFast(page, nick) {
   return await page.evaluate((n) => {
-    // STATUS — somente na linha que contém o <b>{nick}</b>
-    let status = null;
-    const nameBlocks = Array.from(document.querySelectorAll('.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'));
+    // STATUS: ícone apenas no header que contém o <b>{nick}</b>
+    let status = '—';
+    const nameBlocks = Array.from(
+      document.querySelectorAll(
+        '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'
+      )
+    );
     const header = nameBlocks.find(c => {
       const b = c.querySelector('b');
       const txt = (b?.textContent || c.textContent || '').trim();
@@ -160,20 +178,20 @@ async function extractFast(page, nick) {
 
     if (header) {
       const img = header.querySelector('img[alt="Online"], img[alt="Offline"]');
-      if (img) status = img.getAttribute('alt') || null;
+      if (img) status = img.getAttribute('alt') || '—';
     }
 
-    if (!status) {
-      // fallback: nenhum status
-      status = '—';
-    }
-
-    // LOCALIZAÇÃO — par label/valor
+    // LOCALIZAÇÃO: dentro do bloco CharPage_char-info__..., pega o 2º <span>
     let location = '—';
-    const spans = Array.from(document.querySelectorAll('span'));
+    const infoRoot =
+      document.querySelector('.CharPage_char-info__EW_Lb') ||
+      document.querySelector('[class*="CharPage_char-info__"]') ||
+      document;
+
+    const spans = Array.from(infoRoot.querySelectorAll('span'));
     for (let i = 0; i < spans.length; i++) {
-      const t = (spans[i].textContent || '').trim();
-      if (/^Localiza(?:ç|c)ão:$/i.test(t)) {
+      const t = (spans[i].textContent || '').replace(/\s+/g, ' ').trim();
+      if (/^Localiza(?:ç|c)ão\s*:?\s*$/i.test(t)) {
         const next = spans[i].parentElement?.querySelectorAll('span')?.[1] || spans[i].nextElementSibling;
         if (next && next.tagName?.toLowerCase() === 'span') {
           location = (next.textContent || '').trim() || '—';
@@ -220,7 +238,7 @@ async function extractFast(page, nick) {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 
-  // Bloqueio: só corta image/font/media/stylesheet; deixa script/xhr/fetch/document liberados (qualquer host)
+  // Bloqueio: corta image/font/media/stylesheet; libera script/xhr/fetch/document (qualquer host)
   await context.route("**/*", (route) => {
     const type = route.request().resourceType();
     if (["image", "font", "media", "stylesheet"].includes(type)) return route.abort();
@@ -228,8 +246,8 @@ async function extractFast(page, nick) {
   });
 
   const page = await context.newPage();
-  page.setDefaultTimeout(2500);
-  page.setDefaultNavigationTimeout(8000);
+  page.setDefaultTimeout(3000);
+  page.setDefaultNavigationTimeout(9000);
 
   // Home 1x: cookies + X-50 1x
   await page.goto(`${BASE}/pt/`, { waitUntil: "domcontentloaded" });
@@ -241,7 +259,7 @@ async function extractFast(page, nick) {
     const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // se por algum motivo voltou pro X-5, corrige rápido
+    // se por algum motivo caiu no X-5, corrige rápido
     const stillX5 = await page.evaluate(() => {
       const sel = document.querySelector('div[class*="SideMenuServers_selected"]');
       const txt = (sel?.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
@@ -252,7 +270,7 @@ async function extractFast(page, nick) {
       await page.goto(url, { waitUntil: "domcontentloaded" });
     }
 
-    await waitForHeaderAndLocation(page, nick, 3500);
+    await waitForHeaderAndLocation(page, nick, 6000);
     const cur = await extractFast(page, nick);
 
     if (!cur.ok) {
@@ -268,7 +286,7 @@ async function extractFast(page, nick) {
       }
     }
 
-    await page.waitForTimeout(110 + Math.random() * 120);
+    await page.waitForTimeout(100 + Math.random() * 120);
   }
 
   if (changes.length) {
