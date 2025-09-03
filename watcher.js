@@ -371,7 +371,7 @@ async function processNick(page, nick) {
       const unix = Math.floor((c.updatedAt || Date.now()) / 1000);
       const url = `${BASE}${PATH}${encodeURIComponent(c.nick)}`;
       const statusLine = `**Status:** \`${c.prevStatus || '—'}\` → \`${c.status}\``;
-      const locLine    = `**Localização:** \`${c.prevLocation || '—'}\` → \`${c.location}\``;
+      const locLine    = `**Location:** \`${c.prevLocation || '—'}\` → \`${c.location}\``;
       const titleEmoji = statusChanged ? (c.status === 'Online' ? '🟢' : '🔴') : '📍';
 
       return {
@@ -387,12 +387,12 @@ async function processNick(page, nick) {
     });
 
     // manda em lotes de até 10 embeds por mensagem (limite do Discord)
-    const header = `**Atualizações (${changes.length})** — ${statusChanges} de status, ${locChangesOnly} de localização`;
+    const header = `**Updates (${changes.length})** — ${statusChanges} of status, ${locChangesOnly} of location`;
     for (let i = 0; i < embeds.length; i += 10) {
       const slice = embeds.slice(i, i + 10);
       await postDiscord({
         username: "MU Watcher X-50",
-        // opcional: avatar_url: "https://i.imgur.com/xxxxxxxx.png",
+        // opcional:avatar_url: "https://i.imgur.com/xxxxxxxx.png",
         content: i === 0 ? header : undefined,
         embeds: slice,
       });
