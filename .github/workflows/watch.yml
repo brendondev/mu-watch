@@ -3,12 +3,7 @@ name: mu-watch
 on:
   schedule:
     - cron: "*/5 * * * *"   # a cada 5 min
-  workflow_dispatch:
-    inputs:
-      nicks:
-        description: 'Lista de nicks separados por vírgula (opcional)'
-        required: false
-        default: ''
+  workflow_dispatch: {}
 
 # Garante execução única por workflow+branch e cancela a anterior imediatamente
 concurrency:
