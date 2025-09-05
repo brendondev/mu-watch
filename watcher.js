@@ -212,7 +212,7 @@ async function extractOnce(page, nick) {
       null;
 
     location = (infoRoot && pickLocation(infoRoot)) || pickLocation(document) || '—';
-    if (/^Lorencia$/i.test(location)) location = 'Privada';
+    if (/^Lorencia$/i.test(location)) location = 'Hidden 🔐';
 
     return { ok: (status !== '—' || (location && location !== '—')), status, location };
   }, nick);
