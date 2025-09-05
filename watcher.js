@@ -213,6 +213,7 @@ async function extractOnce(page, nick) {
 
     location = (infoRoot && pickLocation(infoRoot)) || pickLocation(document) || '—';
     if (/^Lorencia$/i.test(location)) location = 'Hidden 🔐';
+    if (/^Noria$/i.test(location)) location = 'Noria 🌸';
 
     return { ok: (status !== '—' || (location && location !== '—')), status, location };
   }, nick);
