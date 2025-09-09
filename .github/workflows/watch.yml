@@ -2,7 +2,7 @@ name: mu-watch
 
 on:
   schedule:
-    - cron: "*/6 * * *"   # ~a cada 10 dias
+    - cron: "*/6 * * * *"   # ~a cada 10 dias
   workflow_dispatch:
     inputs:
       nicks:
