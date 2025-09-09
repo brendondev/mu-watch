@@ -18,18 +18,17 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15             # mais folga pro job inteiro
+    timeout-minutes: 15
     permissions:
-      contents: write               # para commitar .state.json
+      contents: write   # para commitar .state.json
     env:
-      # Config padrão (pode ajustar via 'env' do step Run watcher se quiser)
       CONCURRENCY: "2"
-      TIME_BUDGET_MS: "270000"      # 4.5 min (evita estourar o step)
-      GIT_PERSIST: "1"              # controla se vamos commitar o .state.json
+      TIME_BUDGET_MS: "270000"   # ~4.5 min (o step abaixo usa 6 min)
+      GIT_PERSIST: "1"           # 0 para não commitar o state
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0            # necessário para dar push
+          fetch-depth: 0
 
       - name: Verify source version
         run: |
@@ -44,12 +43,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-          cache-dependency-path: "package-lock.json"
 
       - name: Install Playwright
         run: |
-          npm ci
+          npm install
           npx playwright install --with-deps chromium
 
       - name: Prepare watchlist (override via dispatch)
@@ -60,7 +57,7 @@ jobs:
           cat watchlist.txt
 
       - name: Run watcher
-        timeout-minutes: 6           # abaixo do budget do job; script encerra antes
+        timeout-minutes: 6
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           MU_BASE_URL: https://mudream.online
