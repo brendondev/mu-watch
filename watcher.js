@@ -1,4 +1,4 @@
-// watcher v1.2.2 — cloudflare + JSON sniffer + SPA-safe + cookies + balanced waits (pure JS)
+// watcher v1.3.0 — cloudflare + JSON sniffer + SPA-safe + cookies + DEBUG (HAR/trace) — pure JS
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -9,12 +9,13 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 1);
+const DEBUG = process.env.DEBUG === "1";
 
 // Orçamento de tempo p/ evitar timeout do Actions (~4,5min default)
 const TIME_BUDGET_MS = Number(process.env.TIME_BUDGET_MS || 270000);
 const HARD_DEADLINE = Date.now() + TIME_BUDGET_MS;
 
-console.log("watcher version v1.2.2 (cloudflare + json sniffer + cookies, pure JS)");
+console.log("watcher version v1.3.0 (cloudflare + json sniffer + cookies + DEBUG)");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL is missing");
@@ -53,9 +54,10 @@ async function postDiscord(payload) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-/* --------------- Cloudflare --------------- */
+/* --------------- CF --------------- */
 async function waitCloudflare(page, maxMs = 12000) {
   const start = Date.now();
+  let seen = false;
   while (Date.now() - start < maxMs) {
     const challenged = await page
       .evaluate(() => {
@@ -66,22 +68,21 @@ async function waitCloudflare(page, maxMs = 12000) {
         return false;
       })
       .catch(() => false);
-    if (!challenged) return;
+    if (!challenged) return seen;
+    seen = true;
     await sleep(500);
   }
+  return seen;
 }
 
-/* --------------- Cookies banner (Usercentrics/Cookiebot) --------------- */
+/* --------------- Cookies --------------- */
 async function closeCookieBanner(page) {
-  const tryClick = async (sel) => {
-    try { await page.locator(sel).first().click({ timeout: 700 }); return true; } catch { return false; }
-  };
+  const tryClick = async (sel) => { try { await page.locator(sel).first().click({ timeout: 700 }); return true; } catch { return false; } };
   if (await tryClick('button:has-text("Permitir todos")')) return;
   if (await tryClick('button:has-text("Rejeitar")')) return;
   if (await tryClick('text=Permitir todos')) return;
   if (await tryClick('text=Rejeitar')) return;
 
-  // tenta em iframes de consentimento
   for (const f of page.frames()) {
     try {
       if (/usercentrics|consent|cookiebot/i.test(f.url())) {
@@ -93,14 +94,13 @@ async function closeCookieBanner(page) {
   }
 }
 
-/* --------------- SPA/Hydration waits --------------- */
+/* --------------- SPA waits --------------- */
 async function waitForHeader(page, nick, timeoutMs = 6500) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const ok = await page
       .evaluate((n) => {
-        const sel =
-          '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]';
+        const sel = '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]';
         const blocks = Array.from(document.querySelectorAll(sel));
         return blocks.some((c) => {
           const b = c.querySelector("b");
@@ -113,6 +113,27 @@ async function waitForHeader(page, nick, timeoutMs = 6500) {
     await sleep(120);
   }
   return false;
+}
+
+/* --------------- DEBUG listeners --------------- */
+function attachDebug(page, tag = "") {
+  if (!DEBUG) return;
+  page.on("console", (msg) => { try { console.log(`[CONSOLE${tag}] ${msg.type()}: ${msg.text()}`); } catch {} });
+  page.on("requestfailed", (req) => {
+    console.log(`[REQFAIL${tag}] ${req.method()} ${req.url()} — ${req.failure()?.errorText || "unknown"}`);
+  });
+  page.on("response", async (res) => {
+    try {
+      const url = res.url();
+      const st = res.status();
+      if (st >= 400) console.log(`[HTTP${st}${tag}] ${url}`);
+      const ct = (res.headers()["content-type"] || "").toLowerCase();
+      if (ct.includes("application/json")) {
+        const t = await res.text();
+        console.log(`[JSON${tag}] ${url} bytes=${t.length}`);
+      }
+    } catch {}
+  });
 }
 
 /* --------------- JSON sniffer --------------- */
@@ -150,7 +171,7 @@ function extractFromJson(any, nick) {
       if (!res.status) {
         const s = obj.status ?? obj.state ?? obj.online;
         if (typeof s === "string") {
-          res.status = /online/i.test(s) ? "Online" : /offline/i.test(s) ? "Offline" : undefined;
+          res.status = /online/i.test(s) ? "Online" : (/offline/i.test(s) ? "Offline" : undefined);
         } else if (typeof s === "boolean") {
           res.status = s ? "Online" : "Offline";
         }
@@ -163,10 +184,9 @@ function extractFromJson(any, nick) {
   }
 
   try { walk(any); } catch {}
-
   if (res.location) {
     if (/^Lorencia$/i.test(res.location)) res.location = "Hidden 🔐";
-    if (/^Noria$/i.test(res.location)) res.location = "Noria 🌸";
+    if (/^Noria$/i.test(res.location))    res.location = "Noria 🌸";
   }
   if (res.status || res.location) return res;
   return null;
@@ -189,6 +209,7 @@ async function waitJsonForNick(page, nick, baseHost, timeoutMs = 7000) {
 
             const text = await r.text();
             if (!text || !text.toLowerCase().includes((nick || "").toLowerCase())) return false;
+            if (DEBUG) console.log(`[JSON-CANDIDATE] ${r.url()} len=${text.length} hasNick=yes`);
             return true;
           } catch {
             return false;
@@ -214,7 +235,7 @@ async function waitJsonForNick(page, nick, baseHost, timeoutMs = 7000) {
         }
       }
     } catch {
-      // timeout do waitForResponse — tenta novamente até o deadline
+      // timeout do waitForResponse
     }
   }
   return null;
@@ -255,8 +276,7 @@ async function extractOnce(page, nick) {
       for (let i = 0; i < spans.length; i++) {
         const t = norm(spans[i].textContent || "");
         if (/^Localiza(?:ç|c)ão\s*:?$|^Location\s*:?$|^Localização$/i.test(t)) {
-          const next =
-            spans[i].parentElement?.querySelector("span:nth-of-type(2)") || spans[i].nextElementSibling;
+          const next = spans[i].parentElement?.querySelector("span:nth-of-type(2)") || spans[i].nextElementSibling;
           const v = norm(next?.textContent || "");
           if (v) return v;
         }
@@ -277,7 +297,7 @@ async function extractOnce(page, nick) {
 
     location = pickLocation(infoRoot) || "—";
     if (/^Lorencia$/i.test(location)) location = "Hidden 🔐";
-    if (/^Noria$/i.test(location)) location = "Noria 🌸";
+    if (/^Noria$/i.test(location))    location = "Noria 🌸";
 
     const ok = status !== "—" || (location && location !== "—");
     return { ok, status, location };
@@ -354,23 +374,26 @@ async function isX5(page) {
     ],
   });
   const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     locale: "pt-BR",
     extraHTTPHeaders: {
       "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
       "upgrade-insecure-requests": "1",
     },
     viewport: { width: 1280, height: 800 },
+    recordHar: DEBUG ? { path: "network.har", content: "embed" } : undefined,
   });
+  if (DEBUG) {
+    await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+  }
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 
   // Router: permite TUDO do domínio base e subdomínios; permite challenges.cloudflare.com; bloqueia trackers comuns
   const baseURL = new URL(BASE);
-  const BASE_HOST = baseURL.host; // ex: mudream.online
-  const BASE_DOMAIN = BASE_HOST.split(".").slice(-2).join("."); // ex: mudream.online
+  const BASE_HOST = baseURL.host;
+  const BASE_DOMAIN = BASE_HOST.split(".").slice(-2).join(".");
   const allowHost = (h) => h === BASE_HOST || h.endsWith(`.${BASE_DOMAIN}`);
 
   await context.route("**/*", (route) => {
@@ -382,37 +405,32 @@ async function isX5(page) {
       const u = new URL(url);
       const h = u.host;
 
-      // Trackers por host (bloqueia)
       if (/(googletagmanager|google-analytics|gtag|facebook|hotjar|yandex|tiktok)/i.test(h)) {
+        if (DEBUG) console.log(`[ROUTE-ABORT] type=${type} url=${url}`);
         return route.abort();
       }
-
-      // Cloudflare challenge
       if (/^challenges\.cloudflare\.com$/i.test(h)) {
         return route.continue();
       }
-
-      // Tudo (script/css/img/font/media/xhr/fetch) do host base e subdomínios
       if (allowHost(h)) {
         return route.continue();
       }
-
-      // Terceiros: aborta só recursos pesados
       if (["script", "stylesheet", "image", "font", "media"].includes(type)) {
+        if (DEBUG) console.log(`[ROUTE-ABORT] type=${type} url=${url}`);
         return route.abort();
       }
-    } catch {
-      // data:, about:, etc.
-    }
+    } catch {}
     return route.continue();
   });
 
-  // Aquecimento: BASE + Cloudflare + selecionar X-50
+  // Aquecimento
   const warm = await context.newPage();
+  attachDebug(warm, ":warm");
   warm.setDefaultTimeout(6000);
   warm.setDefaultNavigationTimeout(16000);
   await warm.goto(`${BASE}/pt/`, { waitUntil: "load" });
-  await waitCloudflare(warm, 12000).catch(() => {});
+  const challengedWarm = await waitCloudflare(warm, 12000).catch(() => false);
+  if (DEBUG && challengedWarm) console.log(`[CF] challenge no warm`);
   await closeCookieBanner(warm).catch(() => {});
   await ensureX50Once(warm).catch(() => {});
   await warm.close();
@@ -421,6 +439,7 @@ async function isX5(page) {
   const pages = [];
   for (let i = 0; i < CONCURRENCY; i++) {
     const p = await context.newPage();
+    attachDebug(p, `:w${i}`);
     p.setDefaultTimeout(6000);
     p.setDefaultNavigationTimeout(16000);
     pages.push(p);
@@ -432,29 +451,26 @@ async function isX5(page) {
   async function processNick(page, nick) {
     const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
     await page.goto(url, { waitUntil: "domcontentloaded" });
-    await waitCloudflare(page, 12000);
+    const challenged1 = await waitCloudflare(page, 12000);
+    if (DEBUG && challenged1) console.log(`[CF] challenge detectado em ${url}`);
 
     if (await isX5(page)) {
       await ensureX50Once(page).catch(() => {});
       await page.goto(url, { waitUntil: "domcontentloaded" });
-      await waitCloudflare(page, 10000);
+      const challenged2 = await waitCloudflare(page, 10000);
+      if (DEBUG && challenged2) console.log(`[CF] challenge detectado após reload ${url}`);
     }
 
     // Em paralelo: sniffer JSON (7s) + espera header (6.5s)
     const baseHost = new URL(BASE).host;
     const jsonPromise = waitJsonForNick(page, nick, baseHost, 7000).catch(() => null);
     const headerPromise = waitForHeader(page, nick, 6500);
-
     const [jsonResult] = await Promise.allSettled([jsonPromise, headerPromise]);
     let dataFromJSON = null;
     if (jsonResult.status === "fulfilled") dataFromJSON = jsonResult.value;
 
     if (dataFromJSON && (dataFromJSON.status || dataFromJSON.location)) {
-      return {
-        ok: true,
-        status: dataFromJSON.status || "—",
-        location: dataFromJSON.location || "—",
-      };
+      return { ok: true, status: dataFromJSON.status || "—", location: dataFromJSON.location || "—" };
     }
 
     // DOM fallback
@@ -476,12 +492,14 @@ async function isX5(page) {
     }
 
     if (!data.ok) {
-      if (process.env.DEBUG === "1") {
+      if (DEBUG) {
         try {
-          const fn = `debug_${encodeURIComponent(nick)}_${Date.now()}.png`;
-          await page.screenshot({ path: fn, fullPage: true });
-          const htmlLen = (await page.content()).length;
-          console.log(`DEBUG: screenshot=${fn} html.length=${htmlLen}`);
+          const ts = Date.now();
+          const base = `debug_${encodeURIComponent(nick)}_${ts}`;
+          await page.screenshot({ path: `${base}.png`, fullPage: true });
+          const html = await page.content();
+          await fs.writeFile(`${base}.html`, html, "utf8");
+          console.log(`[DEBUG] Salvos ${base}.png e ${base}.html (len=${html.length})`);
         } catch {}
       }
       return { ok: false, status: "—", location: "—", error: "no-data" };
@@ -502,13 +520,7 @@ async function isX5(page) {
           const changed = prev.status !== cur.status || prev.location !== cur.location;
           if (changed) {
             const now = Date.now();
-            changes.push({
-              nick,
-              ...cur,
-              prevStatus: prev.status ?? "—",
-              prevLocation: prev.location ?? "—",
-              updatedAt: now,
-            });
+            changes.push({ nick, ...cur, prevStatus: prev.status ?? "—", prevLocation: prev.location ?? "—", updatedAt: now });
             state[nick] = { status: cur.status, location: cur.location, updatedAt: now };
           } else {
             console.log(`no change ${nick}: status=${cur.status} loc=${cur.location}`);
@@ -536,15 +548,13 @@ async function isX5(page) {
       const unix = Math.floor((c.updatedAt || Date.now()) / 1000);
       const url = `${BASE}${PATH}${encodeURIComponent(c.nick)}`;
       const statusLine = `**Status:** \`${c.prevStatus || "—"}\` → \`${c.status}\``;
-      const locLine = `**Location:** \`${c.prevLocation || "—"}\` → \`${c.location}\``;
+      const locLine    = `**Location:** \`${c.prevLocation || "—"}\` → \`${c.location}\``;
       const titleEmoji = statusChanged ? (c.status === "Online" ? "🟢" : "🔴") : "📍";
-
       return {
         title: `${titleEmoji} ${c.nick}`,
-        url,
-        color,
+        url, color,
         description: `${statusLine}\n${locLine}\n\n⏱️ <t:${unix}:f> • <t:${unix}:R>`,
-        footer: { text: `watcher v1.2.2 • GuildWar (X-50) • CONCURRENCY=${CONCURRENCY}` },
+        footer: { text: `watcher v1.3.0 • GuildWar (X-50) • CONCURRENCY=${CONCURRENCY}` },
         timestamp: new Date(c.updatedAt || Date.now()).toISOString(),
       };
     });
@@ -552,11 +562,7 @@ async function isX5(page) {
     const header = `**Updates (${changes.length})** — ${statusChanges} of status, ${locChangesOnly} of location`;
     for (let i = 0; i < embeds.length; i += 10) {
       const slice = embeds.slice(i, i + 10);
-      await postDiscord({
-        username: "MU Watcher X-50",
-        content: i === 0 ? header : undefined,
-        embeds: slice,
-      });
+      await postDiscord({ username: "MU Watcher X-50", content: i === 0 ? header : undefined, embeds: slice });
       await sleep(300);
     }
   } else {
@@ -564,6 +570,8 @@ async function isX5(page) {
   }
 
   await saveState(state);
-  await Promise.all(pages.map((p) => p.close()));
+  if (DEBUG) {
+    try { await context.tracing.stop({ path: "trace.zip" }); } catch {}
+  }
   await browser.close();
 })();
