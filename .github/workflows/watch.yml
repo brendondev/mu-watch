@@ -2,8 +2,7 @@ name: mu-watch
 
 on:
   schedule:
-    # GitHub cron NÃO aceita "*/240" em horas. Aproximação: a cada 10 dias do mês.
-    - cron: "0 0 */10 * *"
+    - cron: "0 0 */10 * *"   # ~a cada 10 dias
   workflow_dispatch:
     inputs:
       nicks:
@@ -11,25 +10,37 @@ on:
         required: false
         default: ""
       debug:
-        description: "Ativar DEBUG (HAR/trace/screenshots)? 1 = sim"
+        description: "DEBUG (HAR/trace/screenshots): 1=sim, 0=não"
+        required: false
+        default: "0"
+      headless:
+        description: "Headless (1=headless, 0=UI)"
+        required: false
+        default: "1"
+      mobile_ua:
+        description: "Forçar UA mobile (iPhone). 1=sim"
         required: false
         default: "0"
 
-# Execução única por workflow+branch e cancela a anterior imediatamente
+# 1 execução por branch; cancela a anterior
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-singleton
   cancel-in-progress: true
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest   # TROQUE para self-hosted p/ IP residencial, se puder
     timeout-minutes: 15
     permissions:
       contents: write
     env:
       CONCURRENCY: "2"
-      TIME_BUDGET_MS: "270000"   # ~4.5 min
+      TIME_BUDGET_MS: "270000"
       GIT_PERSIST: "1"
+      # Proxy (opcional, recomendado residencial). Configure em Secrets.
+      PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+      PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+      PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,8 +69,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.nicks != '' }}
         run: |
           echo "${{ github.event.inputs.nicks }}" | tr ',' '\n' | sed 's/^ *//; s/ *$//' > watchlist.txt
-          echo "Watchlist override:"
-          cat watchlist.txt
+          echo "Watchlist override:"; cat watchlist.txt
 
       - name: Run watcher
         timeout-minutes: 6
@@ -72,6 +82,11 @@ jobs:
           CONCURRENCY: ${{ env.CONCURRENCY }}
           TIME_BUDGET_MS: ${{ env.TIME_BUDGET_MS }}
           DEBUG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug == '1' && '1' || '0' }}
+          HEADLESS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.headless || '1' }}
+          MOBILE_UA: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mobile_ua || '0' }}
+          PROXY_SERVER: ${{ env.PROXY_SERVER }}
+          PROXY_USERNAME: ${{ env.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ env.PROXY_PASSWORD }}
         run: |
           node -v
           node watcher.js
