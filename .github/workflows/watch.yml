@@ -2,7 +2,7 @@ name: mu-watch
 
 on:
   schedule:
-    - cron: "*/6 * * * *"   # a cada 6 min
+    - cron: "*/666666 * * * *"   # a cada 6 min
   workflow_dispatch: {}
 
 # Garante execução única por workflow+branch e cancela a anterior imediatamente
