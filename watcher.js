@@ -1,4 +1,4 @@
-// watcher v1.2.1 — cloudflare + JSON sniffer + SPA-safe + balanced waits (pure JS)
+// watcher v1.2.2 — cloudflare + JSON sniffer + SPA-safe + cookies + balanced waits (pure JS)
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -14,7 +14,7 @@ const CONCURRENCY = Number(process.env.CONCURRENCY || 1);
 const TIME_BUDGET_MS = Number(process.env.TIME_BUDGET_MS || 270000);
 const HARD_DEADLINE = Date.now() + TIME_BUDGET_MS;
 
-console.log("watcher version v1.2.1 (cloudflare + json sniffer, pure JS)");
+console.log("watcher version v1.2.2 (cloudflare + json sniffer + cookies, pure JS)");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL is missing");
@@ -71,6 +71,28 @@ async function waitCloudflare(page, maxMs = 12000) {
   }
 }
 
+/* --------------- Cookies banner (Usercentrics/Cookiebot) --------------- */
+async function closeCookieBanner(page) {
+  const tryClick = async (sel) => {
+    try { await page.locator(sel).first().click({ timeout: 700 }); return true; } catch { return false; }
+  };
+  if (await tryClick('button:has-text("Permitir todos")')) return;
+  if (await tryClick('button:has-text("Rejeitar")')) return;
+  if (await tryClick('text=Permitir todos')) return;
+  if (await tryClick('text=Rejeitar')) return;
+
+  // tenta em iframes de consentimento
+  for (const f of page.frames()) {
+    try {
+      if (/usercentrics|consent|cookiebot/i.test(f.url())) {
+        const btn = f.locator('button:has-text("Permitir todos"), button:has-text("Rejeitar")').first();
+        await btn.click({ timeout: 800 });
+        return;
+      }
+    } catch {}
+  }
+}
+
 /* --------------- SPA/Hydration waits --------------- */
 async function waitForHeader(page, nick, timeoutMs = 6500) {
   const start = Date.now();
@@ -94,7 +116,6 @@ async function waitForHeader(page, nick, timeoutMs = 6500) {
 }
 
 /* --------------- JSON sniffer --------------- */
-/** Busca recursivamente por status/location dentro de um objeto JSON arbitrário */
 function extractFromJson(any, nick) {
   const res = {};
   const visited = new Set();
@@ -125,7 +146,6 @@ function extractFromJson(any, nick) {
       if (typeof v === "object" && v) walk(v);
     }
 
-    // Heurística extra se o nó parece ser o do nick
     if (matchNick) {
       if (!res.status) {
         const s = obj.status ?? obj.state ?? obj.online;
@@ -142,9 +162,7 @@ function extractFromJson(any, nick) {
     }
   }
 
-  try {
-    walk(any);
-  } catch {}
+  try { walk(any); } catch {}
 
   if (res.location) {
     if (/^Lorencia$/i.test(res.location)) res.location = "Hidden 🔐";
@@ -154,7 +172,6 @@ function extractFromJson(any, nick) {
   return null;
 }
 
-/** Espera por uma resposta JSON do mesmo domínio que contenha o nick e campos úteis */
 async function waitJsonForNick(page, nick, baseHost, timeoutMs = 7000) {
   const deadline = Date.now() + timeoutMs;
 
@@ -527,7 +544,7 @@ async function isX5(page) {
         url,
         color,
         description: `${statusLine}\n${locLine}\n\n⏱️ <t:${unix}:f> • <t:${unix}:R>`,
-        footer: { text: `watcher v1.2.1 • GuildWar (X-50) • CONCURRENCY=${CONCURRENCY}` },
+        footer: { text: `watcher v1.2.2 • GuildWar (X-50) • CONCURRENCY=${CONCURRENCY}` },
         timestamp: new Date(c.updatedAt || Date.now()).toISOString(),
       };
     });
