@@ -1,4 +1,4 @@
-// watcher v1 — balanced waits, progressive retries, batch Discord, stable X-50 (patched)
+// watcher v1.1 — Cloudflare-aware, balanced waits, progressive retries, batch Discord, stable X-50
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -10,11 +10,11 @@ const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 1); // ajuste se necessário
 
-// === NOVO: orçamento de tempo para evitar timeout do Actions (padrão ~4,5min) ===
+// Orçamento de tempo para evitar timeout do Actions (padrão ~4,5min)
 const TIME_BUDGET_MS = Number(process.env.TIME_BUDGET_MS || 270000);
 const HARD_DEADLINE = Date.now() + TIME_BUDGET_MS;
 
-console.log("watcher version v1");
+console.log("watcher version v1.1 (cloudflare-aware)");
 
 if (!WEBHOOK) {
   console.error("DISCORD_WEBHOOK_URL is missing");
@@ -59,6 +59,23 @@ function chunkText(s, lim = 1900) {
     i += lim;
   }
   return chunks;
+}
+
+/* ---------------- Cloudflare helpers ---------------- */
+async function waitCloudflare(page, maxMs = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    const challenged = await page.evaluate(() => {
+      const t = document.title || "";
+      if (/just a moment|checking your browser|attention required|verifying you are human/i.test(t)) return true;
+      if (document.querySelector('#challenge-stage')) return true;
+      if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
+      // Alguns temas mostram um spinner com texto "Checking..."
+      return false;
+    }).catch(() => false);
+    if (!challenged) return; // challenge terminou
+    await page.waitForTimeout(500);
+  }
 }
 
 /* ---------------- Page helpers ---------------- */
@@ -130,55 +147,30 @@ async function isX5(page) {
   }).catch(() => false);
 }
 
-// espera header + localização não vazia (até 6.5s)
-async function waitForHeaderAndLocation(page, nick, timeoutMs = 6500) {
+// espera somente o header (nome do nick) — localização pode atrasar
+async function waitForHeader(page, nick, timeoutMs = 6500) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const ok = await page.evaluate((n) => {
-      const nameBlocks = Array.from(
-        document.querySelectorAll(
-          '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'
-        )
-      );
-      const header = nameBlocks.find(c => {
+      const sel = '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]';
+      const blocks = Array.from(document.querySelectorAll(sel));
+      return blocks.some(c => {
         const b = c.querySelector('b');
         const txt = (b?.textContent || c.textContent || '').trim();
         return new RegExp(`\\b${n}\\b`, 'i').test(txt);
       });
-      if (!header) return false;
-
-      const pick = (root) => {
-        const spans = Array.from(root.querySelectorAll('span'));
-        for (let i = 0; i < spans.length; i++) {
-          const t = (spans[i].textContent || '').replace(/\s+/g, ' ').trim();
-          if (/^Localiza(?:ç|c)ão\s*:?\s*$/i.test(t)) {
-            const next = spans[i].parentElement?.querySelectorAll('span')?.[1] || spans[i].nextElementSibling;
-            const val = next && next.tagName?.toLowerCase() === 'span' ? (next.textContent || '').trim() : '';
-            if (val) return true;
-          }
-        }
-        return false;
-      };
-
-      const infoRoot =
-        document.querySelector('.CharPage_char-info__EW_Lb') ||
-        document.querySelector('[class*="CharPage_char-info__"]') ||
-        null;
-
-      return (infoRoot && pick(infoRoot)) || pick(document);
     }, nick).catch(() => false);
-
-    if (ok) return;
-    await page.waitForTimeout(140);
+    if (ok) return true;
+    await page.waitForTimeout(120);
   }
+  return false;
 }
 
-// === SUBSTITUÍDO: mais robusto (texto + <img alt>) ===
+// Mais robusto (texto + <img alt>)
 async function extractOnce(page, nick) {
   return await page.evaluate((n) => {
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    // Localiza o bloco do nome por múltiplos seletores
     const nameBlocks = Array.from(document.querySelectorAll(
       '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'
     ));
@@ -191,14 +183,11 @@ async function extractOnce(page, nick) {
 
     // STATUS
     let status = "—";
-
     if (header) {
-      // 1) Tenta por texto próximo ao header
       const headerTxt = norm(header.textContent || "");
       if (/\bONLINE\b/i.test(headerTxt)) status = "Online";
       else if (/\bOFFLINE\b/i.test(headerTxt)) status = "Offline";
 
-      // 2) Fallback: <img alt="Online/Offline">
       if (status === "—") {
         const img = header.querySelector('img[alt]');
         const alt = img?.getAttribute("alt") || "";
@@ -209,7 +198,6 @@ async function extractOnce(page, nick) {
 
     // LOCATION
     const pickLocation = (root) => {
-      // Procura rótulo "Localização" ou "Location"
       const spans = Array.from(root.querySelectorAll('span, div, p'));
       for (let i = 0; i < spans.length; i++) {
         const t = norm(spans[i].textContent || "");
@@ -220,7 +208,6 @@ async function extractOnce(page, nick) {
           if (v) return v;
         }
       }
-      // Fallback: par "Localização: Valor" no mesmo nó
       const any = spans.find(el => /Localiza(?:ç|c)ão|Location/i.test(norm(el.textContent || "")));
       if (any) {
         const m = norm(any.textContent || "").match(/(?:Localiza(?:ç|c)ão|Location)\s*:?\s*(.+)$/i);
@@ -236,47 +223,12 @@ async function extractOnce(page, nick) {
       document;
 
     location = pickLocation(infoRoot) || "—";
-
-    // Normalizações
     if (/^Lorencia$/i.test(location)) location = "Hidden 🔐";
     if (/^Noria$/i.test(location))    location = "Noria 🌸";
 
     const ok = (status !== "—") || (location && location !== "—");
     return { ok, status, location };
   }, nick);
-}
-
-// rotina por nick (com reload opcional)
-async function processNick(page, nick) {
-  const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
-  await page.goto(url, { waitUntil: "domcontentloaded" });
-
-  if (await isX5(page)) {
-    await ensureX50Once(page).catch(() => {});
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-  }
-
-  await waitForHeaderAndLocation(page, nick, 6500);
-  await page.waitForTimeout(150);
-
-  // tenta extrair com 4 re-tentativas progressivas
-  const delays = [0, 250, 400, 600, 800];
-  let data = { ok: false, status: '—', location: '—' };
-  for (const d of delays) {
-    if (d) await page.waitForTimeout(d);
-    data = await extractOnce(page, nick);
-    if (data.ok && data.location !== '—') break;
-  }
-
-  // se ainda ruim, 1 reload rápido e última tentativa
-  if (!data.ok || data.location === '—') {
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await waitForHeaderAndLocation(page, nick, 2500);
-    await page.waitForTimeout(200);
-    data = await extractOnce(page, nick);
-  }
-
-  return data.ok ? data : { ok: false, status: '—', location: '—', error: 'no-data' };
 }
 
 /* ------------------------------ MAIN ------------------------------ */
@@ -310,44 +262,52 @@ async function processNick(page, nick) {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 
-  // === SUBSTITUÍDO: NÃO bloquear imagens do mesmo host; bloquear terceiros/trackers ===
-  const host = new URL(BASE).host;
+  // Roteamento: permite subdomínios do BASE e o script de challenge do Cloudflare
+  const baseURL = new URL(BASE);
+  const BASE_HOST = baseURL.host;                               // ex: mudream.online
+  const BASE_DOMAIN = BASE_HOST.split('.').slice(-2).join('.'); // ex: mudream.online
+  const allowHost = (h) => h === BASE_HOST || h.endsWith(`.${BASE_DOMAIN}`);
+
   await context.route("**/*", (route) => {
     const req = route.request();
     const type = req.resourceType();
     const url  = req.url();
 
-    // Bloqueia trackers óbvios
-    if (/(googletagmanager|google-analytics|gtag|facebook|hotjar|yandex|tiktok)/i.test(url)) {
-      return route.abort();
-    }
-
     try {
       const u = new URL(url);
-      const isSameHost = u.host === host;
+      const h = u.host;
 
-      // Permitir IMAGENS do mesmo host (precisamos do <img alt="Online/Offline">)
-      if (type === "image") {
-        return isSameHost ? route.continue() : route.abort();
-      }
-
-      // JS/CSS apenas do host (terceiros: aborta)
-      if ((type === "script" || type === "stylesheet") && !isSameHost) {
+      // Bloqueia trackers óbvios (por host)
+      if (/(googletagmanager|google-analytics|gtag|facebook|hotjar|yandex|tiktok)/i.test(h)) {
         return route.abort();
       }
-    } catch {}
 
-    // Fonte/mídia: bloqueia para poupar (ajuste se precisar)
-    if (type === "font" || type === "media") return route.abort();
+      // Permite o script de challenge do Cloudflare
+      if (/^challenges\.cloudflare\.com$/i.test(h) && type === "script") {
+        return route.continue();
+      }
 
+      // Permite JS/CSS/IMAGENS do domínio base e subdomínios (ex: static.mudream.online)
+      if (["script","stylesheet","image"].includes(type) && (allowHost(h) || /^challenges\.cloudflare\.com$/i.test(h))) {
+        return route.continue();
+      }
+
+      // Bloqueia terceiros pesados
+      if (["script","stylesheet","image","font","media"].includes(type)) {
+        return route.abort();
+      }
+    } catch {
+      // data:, about: etc. — segue
+    }
     return route.continue();
   });
 
-  // aquecimento: cookies + X-50
+  // aquecimento: cookies + X-50 + esperar Cloudflare
   const warm = await context.newPage();
-  warm.setDefaultTimeout(5000);               // aumentado
-  warm.setDefaultNavigationTimeout(15000);    // aumentado
-  await warm.goto(`${BASE}/pt/`, { waitUntil: "load" }); // carrega completo só no warm
+  warm.setDefaultTimeout(5000);
+  warm.setDefaultNavigationTimeout(15000);
+  await warm.goto(`${BASE}/pt/`, { waitUntil: "load" });
+  await waitCloudflare(warm, 10000).catch(() => {});
   await closeCookieBanner(warm).catch(() => {});
   await ensureX50Once(warm).catch(() => {});
   await warm.close();
@@ -356,13 +316,59 @@ async function processNick(page, nick) {
   const pages = [];
   for (let i = 0; i < CONCURRENCY; i++) {
     const p = await context.newPage();
-    p.setDefaultTimeout(5000);             // aumentado
-    p.setDefaultNavigationTimeout(15000);  // aumentado
+    p.setDefaultTimeout(5000);
+    p.setDefaultNavigationTimeout(15000);
     pages.push(p);
   }
 
   const changes = [];
   let idx = 0;
+
+  async function processNick(page, nick) {
+    const url = `${BASE}${PATH}${encodeURIComponent(nick)}`;
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await waitCloudflare(page, 10000);
+
+    if (await isX5(page)) {
+      await ensureX50Once(page).catch(() => {});
+      await page.goto(url, { waitUntil: "domcontentloaded" });
+      await waitCloudflare(page, 8000);
+    }
+
+    await waitForHeader(page, nick, 6500);
+    await page.waitForTimeout(150);
+
+    // tenta extrair com re-tentativas progressivas
+    const delays = [0, 250, 400, 600, 800];
+    let data = { ok: false, status: '—', location: '—' };
+    for (const d of delays) {
+      if (d) await page.waitForTimeout(d);
+      data = await extractOnce(page, nick);
+      if (data.ok && data.location !== '—') break;
+    }
+
+    // reload + última tentativa
+    if (!data.ok || data.location === '—') {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await waitCloudflare(page, 8000);
+      await waitForHeader(page, nick, 2500);
+      await page.waitForTimeout(200);
+      data = await extractOnce(page, nick);
+    }
+
+    if (!data.ok) {
+      if (process.env.DEBUG === '1') {
+        try {
+          const fn = `debug_${encodeURIComponent(nick)}_${Date.now()}.png`;
+          await page.screenshot({ path: fn, fullPage: true });
+          const htmlLen = (await page.content()).length;
+          console.log(`DEBUG: screenshot=${fn} html.length=${htmlLen}`);
+        } catch {}
+      }
+      return { ok: false, status: '—', location: '—', error: 'no-data' };
+    }
+    return data;
+  }
 
   async function worker(p) {
     while (idx < list.length && Date.now() < HARD_DEADLINE) {
@@ -402,11 +408,9 @@ async function processNick(page, nick) {
   await Promise.all(pages.map((p) => worker(p)));
 
   if (changes.length) {
-    // resumo
     const statusChanges = changes.filter(c => c.prevStatus !== c.status).length;
     const locChangesOnly = changes.length - statusChanges;
 
-    // monta embeds (1 por nick)
     const embeds = changes.map((c) => {
       const statusChanged = c.prevStatus !== c.status;
       const color = statusChanged
@@ -424,9 +428,7 @@ async function processNick(page, nick) {
         url,
         color,
         description: `${statusLine}\n${locLine}\n\n⏱️ <t:${unix}:f> • <t:${unix}:R>`,
-        footer: {
-          text: `watcher v1 • GuildWar (X-50) • CONCURRENCY=${CONCURRENCY}`
-        },
+        footer: { text: `watcher v1.1 • GuildWar (X-50) • CONCURRENCY=${CONCURRENCY}` },
         timestamp: new Date(c.updatedAt || Date.now()).toISOString(),
       };
     });
