@@ -1,4 +1,4 @@
-// watcher v1 — balanced waits, progressive retries, batch Discord, stable X-50
+// watcher v1 — balanced waits, progressive retries, batch Discord, stable X-50 (patched)
 import { chromium } from "playwright";
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -9,6 +9,10 @@ const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 1); // ajuste se necessário
+
+// === NOVO: orçamento de tempo para evitar timeout do Actions (padrão ~4,5min) ===
+const TIME_BUDGET_MS = Number(process.env.TIME_BUDGET_MS || 270000);
+const HARD_DEADLINE = Date.now() + TIME_BUDGET_MS;
 
 console.log("watcher version v1");
 
@@ -169,53 +173,76 @@ async function waitForHeaderAndLocation(page, nick, timeoutMs = 6500) {
   }
 }
 
+// === SUBSTITUÍDO: mais robusto (texto + <img alt>) ===
 async function extractOnce(page, nick) {
   return await page.evaluate((n) => {
-    // STATUS — junto ao <b>{nick}</b>
-    let status = '—';
-    const nameBlocks = Array.from(
-      document.querySelectorAll(
-        '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'
-      )
-    );
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+    // Localiza o bloco do nome por múltiplos seletores
+    const nameBlocks = Array.from(document.querySelectorAll(
+      '.CharPage_name__wtExV, [class*="CharPage_name__"], .CharPage_name-block__nxxRU, [class*="CharPage_name-block__"]'
+    ));
+
     const header = nameBlocks.find(c => {
       const b = c.querySelector('b');
-      const txt = (b?.textContent || c.textContent || '').trim();
-      return new RegExp(`\\b${n}\\b`, 'i').test(txt);
+      const txt = norm(b?.textContent || c.textContent || "");
+      return new RegExp(`\\b${n}\\b`, "i").test(txt);
     }) || null;
 
+    // STATUS
+    let status = "—";
+
     if (header) {
-      const img = header.querySelector('img[alt="Online"], img[alt="Offline"]');
-      if (img) status = img.getAttribute('alt') || '—';
+      // 1) Tenta por texto próximo ao header
+      const headerTxt = norm(header.textContent || "");
+      if (/\bONLINE\b/i.test(headerTxt)) status = "Online";
+      else if (/\bOFFLINE\b/i.test(headerTxt)) status = "Offline";
+
+      // 2) Fallback: <img alt="Online/Offline">
+      if (status === "—") {
+        const img = header.querySelector('img[alt]');
+        const alt = img?.getAttribute("alt") || "";
+        if (/^online$/i.test(alt)) status = "Online";
+        else if (/^offline$/i.test(alt)) status = "Offline";
+      }
     }
 
-    // LOCATION — primeiro no char-info, depois global fallback
+    // LOCATION
     const pickLocation = (root) => {
-      const spans = Array.from(root.querySelectorAll('span'));
+      // Procura rótulo "Localização" ou "Location"
+      const spans = Array.from(root.querySelectorAll('span, div, p'));
       for (let i = 0; i < spans.length; i++) {
-        const t = (spans[i].textContent || '').replace(/\s+/g, ' ').trim();
-        if (/^Localiza(?:ç|c)ão\s*:?\s*$/i.test(t)) {
-          const next = spans[i].parentElement?.querySelectorAll('span')?.[1] || spans[i].nextElementSibling;
-          if (next && next.tagName?.toLowerCase() === 'span') {
-            const v = (next.textContent || '').trim();
-            if (v) return v;
-          }
+        const t = norm(spans[i].textContent || "");
+        if (/^Localiza(?:ç|c)ão\s*:?$|^Location\s*:?$|^Localização$/i.test(t)) {
+          const next = spans[i].parentElement?.querySelector('span:nth-of-type(2)') ||
+                       spans[i].nextElementSibling;
+          const v = norm(next?.textContent || "");
+          if (v) return v;
         }
+      }
+      // Fallback: par "Localização: Valor" no mesmo nó
+      const any = spans.find(el => /Localiza(?:ç|c)ão|Location/i.test(norm(el.textContent || "")));
+      if (any) {
+        const m = norm(any.textContent || "").match(/(?:Localiza(?:ç|c)ão|Location)\s*:?\s*(.+)$/i);
+        if (m && m[1]) return norm(m[1]);
       }
       return null;
     };
 
-    let location = '—';
+    let location = "—";
     const infoRoot =
       document.querySelector('.CharPage_char-info__EW_Lb') ||
       document.querySelector('[class*="CharPage_char-info__"]') ||
-      null;
+      document;
 
-    location = (infoRoot && pickLocation(infoRoot)) || pickLocation(document) || '—';
-    if (/^Lorencia$/i.test(location)) location = 'Hidden 🔐';
-    if (/^Noria$/i.test(location)) location = 'Noria 🌸';
+    location = pickLocation(infoRoot) || "—";
 
-    return { ok: (status !== '—' || (location && location !== '—')), status, location };
+    // Normalizações
+    if (/^Lorencia$/i.test(location)) location = "Hidden 🔐";
+    if (/^Noria$/i.test(location))    location = "Noria 🌸";
+
+    const ok = (status !== "—") || (location && location !== "—");
+    return { ok, status, location };
   }, nick);
 }
 
@@ -283,30 +310,44 @@ async function processNick(page, nick) {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
 
-  // bloquear image/font/media e trackers; manter JS/CSS do host
+  // === SUBSTITUÍDO: NÃO bloquear imagens do mesmo host; bloquear terceiros/trackers ===
   const host = new URL(BASE).host;
   await context.route("**/*", (route) => {
     const req = route.request();
     const type = req.resourceType();
-    const url = req.url();
-    if (["image", "font", "media"].includes(type)) return route.abort();
+    const url  = req.url();
+
+    // Bloqueia trackers óbvios
     if (/(googletagmanager|google-analytics|gtag|facebook|hotjar|yandex|tiktok)/i.test(url)) {
       return route.abort();
     }
+
     try {
       const u = new URL(url);
-      if ((type === "script" || type === "stylesheet") && u.host !== host) {
+      const isSameHost = u.host === host;
+
+      // Permitir IMAGENS do mesmo host (precisamos do <img alt="Online/Offline">)
+      if (type === "image") {
+        return isSameHost ? route.continue() : route.abort();
+      }
+
+      // JS/CSS apenas do host (terceiros: aborta)
+      if ((type === "script" || type === "stylesheet") && !isSameHost) {
         return route.abort();
       }
     } catch {}
+
+    // Fonte/mídia: bloqueia para poupar (ajuste se precisar)
+    if (type === "font" || type === "media") return route.abort();
+
     return route.continue();
   });
 
   // aquecimento: cookies + X-50
   const warm = await context.newPage();
-  warm.setDefaultTimeout(3000);
-  warm.setDefaultNavigationTimeout(9000);
-  await warm.goto(`${BASE}/pt/`, { waitUntil: "domcontentloaded" });
+  warm.setDefaultTimeout(5000);               // aumentado
+  warm.setDefaultNavigationTimeout(15000);    // aumentado
+  await warm.goto(`${BASE}/pt/`, { waitUntil: "load" }); // carrega completo só no warm
   await closeCookieBanner(warm).catch(() => {});
   await ensureX50Once(warm).catch(() => {});
   await warm.close();
@@ -315,8 +356,8 @@ async function processNick(page, nick) {
   const pages = [];
   for (let i = 0; i < CONCURRENCY; i++) {
     const p = await context.newPage();
-    p.setDefaultTimeout(3200);
-    p.setDefaultNavigationTimeout(9000);
+    p.setDefaultTimeout(5000);             // aumentado
+    p.setDefaultNavigationTimeout(15000);  // aumentado
     pages.push(p);
   }
 
@@ -324,13 +365,13 @@ async function processNick(page, nick) {
   let idx = 0;
 
   async function worker(p) {
-    while (idx < list.length) {
+    while (idx < list.length && Date.now() < HARD_DEADLINE) {
       const myIdx = idx++;
       const nick = list[myIdx];
       try {
         const cur = await processNick(p, nick);
         if (!cur.ok) {
-          console.log(`skip ${nick}: ${cur.error || "no data"}`);
+          console.log(`skip ${nick}: ${cur.error || "no-data"}`);
         } else {
           const prev = state[nick] || {};
           const changed = prev.status !== cur.status || prev.location !== cur.location;
@@ -353,6 +394,9 @@ async function processNick(page, nick) {
       }
       await p.waitForTimeout(80 + Math.random() * 120);
     }
+    if (Date.now() >= HARD_DEADLINE) {
+      console.log("time budget reached — exiting gracefully");
+    }
   }
 
   await Promise.all(pages.map((p) => worker(p)));
@@ -362,12 +406,12 @@ async function processNick(page, nick) {
     const statusChanges = changes.filter(c => c.prevStatus !== c.status).length;
     const locChangesOnly = changes.length - statusChanges;
 
-    // monta embeds (1 por nick), com cores e before→after
+    // monta embeds (1 por nick)
     const embeds = changes.map((c) => {
       const statusChanged = c.prevStatus !== c.status;
       const color = statusChanged
-        ? (c.status === 'Online' ? 0x2ecc71 : 0xe74c3c) // verde / vermelho
-        : 0x3498db; // azul para mudança só de localização
+        ? (c.status === 'Online' ? 0x2ecc71 : 0xe74c3c)
+        : 0x3498db;
 
       const unix = Math.floor((c.updatedAt || Date.now()) / 1000);
       const url = `${BASE}${PATH}${encodeURIComponent(c.nick)}`;
@@ -387,13 +431,11 @@ async function processNick(page, nick) {
       };
     });
 
-    // manda em lotes de até 10 embeds por mensagem (limite do Discord)
     const header = `**Updates (${changes.length})** — ${statusChanges} of status, ${locChangesOnly} of location`;
     for (let i = 0; i < embeds.length; i += 10) {
       const slice = embeds.slice(i, i + 10);
       await postDiscord({
         username: "MU Watcher X-50",
-        // opcional:avatar_url: "https://i.imgur.com/xxxxxxxx.png",
         content: i === 0 ? header : undefined,
         embeds: slice,
       });
