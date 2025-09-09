@@ -2,10 +2,15 @@ name: mu-watch
 
 on:
   schedule:
-    - cron: "*/666666 * * * *"   # a cada 6 min
-  workflow_dispatch: {}
+    - cron: "*/6 * * * *"   # a cada 6 min
+  workflow_dispatch:
+    inputs:
+      nicks:
+        description: "Lista de nicks separados por vírgula (override do watchlist)"
+        required: false
+        default: ""
 
-# Garante execução única por workflow+branch e cancela a anterior imediatamente
+# Execução única por workflow+branch e cancela a anterior imediatamente
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-singleton
   cancel-in-progress: true
@@ -13,12 +18,18 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15             # mais folga pro job inteiro
     permissions:
-      contents: write   # para commitar .state.json
+      contents: write               # para commitar .state.json
+    env:
+      # Config padrão (pode ajustar via 'env' do step Run watcher se quiser)
+      CONCURRENCY: "2"
+      TIME_BUDGET_MS: "270000"      # 4.5 min (evita estourar o step)
+      GIT_PERSIST: "1"              # controla se vamos commitar o .state.json
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0           # necessário para dar push
+          fetch-depth: 0            # necessário para dar push
 
       - name: Verify source version
         run: |
@@ -33,35 +44,37 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: "package-lock.json"
 
       - name: Install Playwright
         run: |
-          npm install
+          npm ci
           npx playwright install --with-deps chromium
 
       - name: Prepare watchlist (override via dispatch)
-        if: ${{ github.event.inputs.nicks != '' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.nicks != '' }}
         run: |
           echo "${{ github.event.inputs.nicks }}" | tr ',' '\n' | sed 's/^ *//; s/ *$//' > watchlist.txt
           echo "Watchlist override:"
           cat watchlist.txt
 
       - name: Run watcher
-        timeout-minutes: 5
+        timeout-minutes: 6           # abaixo do budget do job; script encerra antes
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           MU_BASE_URL: https://mudream.online
           MU_CHAR_PATH: /pt/char/
           WATCHLIST_FILE: watchlist.txt
           STATE_FILE: .state.json
-          GIT_PERSIST: '1'         # pra commitar o state.json
-          # FORCE_POST: '1'        # opcional pra forçar envio
+          CONCURRENCY: ${{ env.CONCURRENCY }}
+          TIME_BUDGET_MS: ${{ env.TIME_BUDGET_MS }}
         run: |
           node -v
           node watcher.js
 
       - name: Commit state
-        if: always()
+        if: ${{ always() && env.GIT_PERSIST == '1' }}
         run: |
           git config user.email "bot@users.noreply.github.com"
           git config user.name "mu-watch-bot"
