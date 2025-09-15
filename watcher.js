@@ -8,7 +8,7 @@ const PATH = process.env.MU_CHAR_PATH || "/pt/char/";
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
 const WATCHLIST_FILE = process.env.WATCHLIST_FILE || "watchlist.txt";
 const STATE_FILE = process.env.STATE_FILE || ".state.json";
-const CONCURRENCY = Number(process.env.CONCURRENCY || 1);
+const CONCURRENCY = Number(process.env.CONCURRENCY || 2);
 
 const DEBUG = process.env.DEBUG === "1";
 const HEADLESS = process.env.HEADLESS !== "0"; // 1 (default) = headless, 0 = com UI
