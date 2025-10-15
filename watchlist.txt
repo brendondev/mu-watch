@@ -54,3 +54,4 @@ Metroid
 KuramaYoko
 DIEGO
 kioshi
+xGorilla
